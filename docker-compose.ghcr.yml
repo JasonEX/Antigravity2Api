@@ -1,11 +1,11 @@
 services:
   antigravity2api:
-    image: ghcr.io/znlsl/antigravity2api:latest
+    image: ghcr.io/JasonEX/antigravity2api:latest
     container_name: antigravity2api
     ports:
-      - "${AG2API_PORT:-3000}:${AG2API_PORT:-3000}"
+      - "${AG2API_HOST:-127.0.0.1}:${AG2API_PORT:-3000}:${AG2API_PORT:-3000}"
     environment:
-      AG2API_HOST: "${AG2API_HOST:-}"
+      AG2API_HOST: "0.0.0.0"
       AG2API_PORT: "${AG2API_PORT:-}"
       AG2API_API_KEYS: "${AG2API_API_KEYS:-}"
       AG2API_PROXY_ENABLED: "${AG2API_PROXY_ENABLED:-}"
