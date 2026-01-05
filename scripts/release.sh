@@ -146,7 +146,7 @@ const pkg = JSON.parse(raw);
 const version = process.env.AG2API_RELEASE_VERSION;
 if (!version) throw new Error("Missing AG2API_RELEASE_VERSION");
 pkg.version = version;
-fs.writeFileSync(pkgPath, JSON.stringify(pkg, null, 2) + "\\n");
+fs.writeFileSync(pkgPath, JSON.stringify(pkg, null, 2) + "\n");
 NODE
 
 if [[ "$DRY_RUN" != "true" ]]; then
