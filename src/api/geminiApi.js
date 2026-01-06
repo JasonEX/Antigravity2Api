@@ -11,6 +11,63 @@ function headersToObject(headers) {
   return out;
 }
 
+function isGemini3ProImageModel(modelName) {
+  return String(modelName || "").startsWith("gemini-3-pro-image");
+}
+
+function getInnerRequest(clientBody) {
+  if (clientBody && typeof clientBody.request === "object" && clientBody.request) {
+    return clientBody.request;
+  }
+  return clientBody || {};
+}
+
+function getPartThoughtSignature(part) {
+  if (!part || typeof part !== "object") return null;
+  const sig = part.thoughtSignature ?? part.thought_signature;
+  if (typeof sig !== "string") return null;
+  const trimmed = sig.trim();
+  return trimmed ? trimmed : null;
+}
+
+function getInlineData(part) {
+  if (!part || typeof part !== "object") return null;
+  return part.inlineData || part.inline_data || null;
+}
+
+function findMissingModelImageThoughtSignature(innerRequest) {
+  const contents = Array.isArray(innerRequest?.contents) ? innerRequest.contents : [];
+  for (let contentIndex = 0; contentIndex < contents.length; contentIndex++) {
+    const content = contents[contentIndex];
+    if (!content || typeof content !== "object") continue;
+    const role = typeof content.role === "string" ? content.role.toLowerCase() : "";
+    const isModel = role === "model" || role === "assistant";
+    if (!isModel) continue;
+
+    const parts = Array.isArray(content.parts) ? content.parts : [];
+    for (let partIndex = 0; partIndex < parts.length; partIndex++) {
+      const part = parts[partIndex];
+      const inlineData = getInlineData(part);
+      if (!inlineData) continue;
+
+      const mimeType =
+        typeof inlineData?.mimeType === "string"
+          ? inlineData.mimeType
+          : typeof inlineData?.mime_type === "string"
+            ? inlineData.mime_type
+            : "";
+      const isImage = !mimeType || String(mimeType).toLowerCase().startsWith("image/");
+      if (!isImage) continue;
+
+      const sig = getPartThoughtSignature(part);
+      if (!sig) {
+        return { contentIndex, partIndex };
+      }
+    }
+  }
+  return null;
+}
+
 class GeminiApi {
   constructor(options = {}) {
     this.auth = options.authManager;
@@ -152,7 +209,34 @@ class GeminiApi {
       this.logDebug("Gemini Request Raw", clientBody || "(empty body)");
 
       const clientBodyJson = JSON.stringify(clientBody || {});
-      const quotaProbe = wrapRequest(JSON.parse(clientBodyJson), { projectId: "", modelName });
+      const parsedClientBody = JSON.parse(clientBodyJson);
+
+      // Pre-validate Gemini 3 Pro Image requests: model-generated image parts in history MUST carry thought signatures.
+      // Otherwise upstream will reject with: "Image part is missing a thought_signature ..."
+      if (isGemini3ProImageModel(modelName)) {
+        const innerRequest = getInnerRequest(parsedClientBody);
+        const missing = findMissingModelImageThoughtSignature(innerRequest);
+        if (missing) {
+          const { contentIndex, partIndex } = missing;
+          return {
+            status: 400,
+            headers: { "Content-Type": "application/json" },
+            body: {
+              error: {
+                code: 400,
+                status: "INVALID_ARGUMENT",
+                message: `Image part is missing a thought_signature in content position ${contentIndex}, part position ${partIndex}.`,
+                details: {
+                  hint:
+                    "You must pass back the exact thoughtSignature/thought_signature from the previous Gemini 3 Pro Image response when including model-generated images in contents history.",
+                },
+              },
+            },
+          };
+        }
+      }
+
+      const quotaProbe = wrapRequest(parsedClientBody, { projectId: "", modelName });
       const modelForQuota = quotaProbe.mappedModelName || modelName;
 
       let loggedWrapped = false;
