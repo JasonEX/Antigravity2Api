@@ -15,6 +15,11 @@ services:
       AG2API_PROXY_URL: "${AG2API_PROXY_URL:-}"
       AG2API_DEBUG: "${AG2API_DEBUG:-}"
 
+      # Optional: Thought Signatures / multi-instance
+      AG2API_THOUGHT_SIGNATURE_STORE_PATH: "${AG2API_THOUGHT_SIGNATURE_STORE_PATH:-}"
+      AG2API_THOUGHT_SIGNATURE_DUMMY: "${AG2API_THOUGHT_SIGNATURE_DUMMY:-}"
+      AG2API_THOUGHT_SIGNATURE_CACHE_MAX: "${AG2API_THOUGHT_SIGNATURE_CACHE_MAX:-}"
+
       # Optional: override OAuth client (otherwise uses built-in defaults)
       # GOOGLE_OAUTH_CLIENT_ID: "${GOOGLE_OAUTH_CLIENT_ID:-}"
       # GOOGLE_OAUTH_CLIENT_SECRET: "${GOOGLE_OAUTH_CLIENT_SECRET:-}"
@@ -22,6 +27,8 @@ services:
     volumes:
       - ./auths:/app/auths
       - ./log:/app/log
+      # Optional: mount a persistent state dir (useful for AG2API_THOUGHT_SIGNATURE_STORE_PATH, etc.)
+      - ./state:/app/state
 
     restart: unless-stopped
 

@@ -65,6 +65,12 @@ AG2API_SWITCH_TO_MCP_MODEL=gemini-3-flash
 npm install
 ```
 
+运行自检用例：
+
+```bash
+npm test
+```
+
 > 本项目核心逻辑可零依赖运行；但如果你启用了代理（`AG2API_PROXY_ENABLED=true`），建议执行一次 `npm install` 以确保代理对 `fetch` 生效（依赖包含 `undici` / `node-fetch` / `*-proxy-agent` 等）。
 
 > **注意**：如果在 PowerShell 中遇到“无法加载文件...npm.ps1”的错误，请尝试使用 CMD 运行，或者使用以下命令绕过策略：

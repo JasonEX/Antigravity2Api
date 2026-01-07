@@ -1,4 +1,4 @@
-const { transformClaudeRequestIn, transformClaudeResponseOut } = require("./src/transform/claude");
+const { transformClaudeRequestIn, transformClaudeResponseOut } = require("../src/transform/claude");
 
 async function primeToolSignatureCache({ toolUseId, thoughtSignature }) {
   const payload = {
@@ -136,4 +136,3 @@ main().catch((err) => {
   console.error("❌ test_turn_signature_scope: FAIL\n", err);
   process.exitCode = 1;
 });
-

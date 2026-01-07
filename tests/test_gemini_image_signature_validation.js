@@ -1,4 +1,4 @@
-const { GeminiApi } = require("./src/api");
+const { GeminiApi } = require("../src/api");
 
 async function testRejectsMissingSignatureOnModelImagePart() {
   let upstreamCalled = false;
@@ -92,4 +92,3 @@ main().catch((err) => {
   console.error("❌ test_gemini_image_signature_validation: FAIL\n", err);
   process.exitCode = 1;
 });
-

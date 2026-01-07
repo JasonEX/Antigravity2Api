@@ -1,4 +1,4 @@
-const { mapClaudeModelToGemini } = require("./src/transform/claude");
+const { mapClaudeModelToGemini } = require("../src/transform/claude");
 
 function assertEqual(actual, expected, label) {
   if (actual !== expected) {
@@ -22,4 +22,3 @@ try {
   console.error("❌ test_haiku_mapping: FAIL\n", err);
   process.exitCode = 1;
 }
-

@@ -207,6 +207,36 @@ function findCurrentTurnStartIndex(messages) {
   return lastTurnStartIndex;
 }
 
+function collectToolResultIdsAfterLastAssistant(messages) {
+  if (!Array.isArray(messages) || messages.length === 0) return new Set();
+
+  // Only treat it as a tool_result "turn" if the tool_result appears after the last assistant message.
+  // Claude requests include full history, so scanning the whole messages[] would incorrectly require
+  // signatures forever.
+  let lastAssistantIndex = -1;
+  for (let i = messages.length - 1; i >= 0; i--) {
+    if (messages[i]?.role === "assistant") {
+      lastAssistantIndex = i;
+      break;
+    }
+  }
+
+  const startIndex = lastAssistantIndex >= 0 ? lastAssistantIndex + 1 : 0;
+  const toolUseIds = new Set();
+  for (let i = startIndex; i < messages.length; i++) {
+    const msg = messages[i];
+    if (!msg || msg.role !== "user") continue;
+    if (!Array.isArray(msg?.content)) continue;
+    for (const item of msg.content) {
+      if (item && item.type === "tool_result" && typeof item.tool_use_id === "string" && item.tool_use_id) {
+        toolUseIds.add(item.tool_use_id);
+      }
+    }
+  }
+
+  return toolUseIds;
+}
+
 function rememberToolThoughtSignature(toolUseId, thoughtSignature) {
   if (!toolUseId || !thoughtSignature) return;
   const id = String(toolUseId);
@@ -993,6 +1023,7 @@ function transformClaudeRequestIn(claudeReq, projectId, options = {}) {
     signatureSegmentStartIndex == null
       ? currentTurnStartIndex
       : Math.max(signatureSegmentStartIndex, currentTurnStartIndex);
+  const requiredToolUseIdsForToolResultTurn = collectToolResultIdsAfterLastAssistant(claudeReq?.messages);
 
   // 记录 tool_use id 到 name 的映射，便于后续 tool_result 还原函数名
   const toolIdToName = new Map();
@@ -1149,15 +1180,29 @@ function transformClaudeRequestIn(claudeReq, projectId, options = {}) {
             if (item.id && item.name) {
               toolIdToName.set(item.id, item.name);
             }
+            const toolUseId = typeof item.id === "string" ? item.id : null;
+            const isRequiredByToolResultTurn =
+              !!toolUseId && requiredToolUseIdsForToolResultTurn.has(toolUseId);
+            const isInCurrentTurn = msgIndex >= currentTurnStartIndex;
+            const isSignatureRelevantTurn = isInCurrentTurn || isRequiredByToolResultTurn;
+            const isInSignatureSegment =
+              signatureSegmentStartIndex == null || msgIndex >= signatureSegmentStartIndex;
+            const shouldTryForwardRealToolSignature =
+              forwardThoughtSignaturesByDefault && isSignatureRelevantTurn && isInSignatureSegment;
             // 如果 tool_use 有 signature（少数客户端会回传），直接使用；
             // 否则从缓存补回（Claude Code 不会回传 tool_use.signature）。
-            const sig = item.signature || getToolThoughtSignature(item.id);
-            if (sig && shouldForwardThoughtSignatures) {
+            const sig = shouldTryForwardRealToolSignature ? item.signature || getToolThoughtSignature(toolUseId) : null;
+            if (sig) {
               fcPart.thoughtSignature = sig;
               if (!item.signature && isDebugEnabled()) {
                 console.log(`[ThoughtSignature] injected tool_use.id=${item.id}`);
               }
-            } else if (!sig && shouldForwardThoughtSignatures && isFirstToolUseInMessage) {
+            } else if (
+              forwardThoughtSignaturesByDefault &&
+              isSignatureRelevantTurn &&
+              isInSignatureSegment &&
+              isFirstToolUseInMessage
+            ) {
               const dummy = getDummyThoughtSignature();
               if (dummy) {
                 fcPart.thoughtSignature = dummy;

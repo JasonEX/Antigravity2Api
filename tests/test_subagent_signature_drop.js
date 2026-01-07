@@ -1,7 +1,7 @@
-const { transformClaudeResponseOut } = require("./src/transform/claude");
+const { transformClaudeResponseOut } = require("../src/transform/claude");
 
-async function testToolUseIdUsesTooluPrefixWhenMissingUpstreamId() {
-  const responseId = "test_fc_no_id";
+async function testDropTrailingSignatureWithoutThinking() {
+  const responseId = "test_resp_1";
 
   const chunk1 = {
     response: {
@@ -9,14 +9,7 @@ async function testToolUseIdUsesTooluPrefixWhenMissingUpstreamId() {
         {
           content: {
             role: "model",
-            parts: [
-              {
-                functionCall: {
-                  name: "Read",
-                  args: { file_path: "E:\\\\misc\\\\temp\\\\1\\\\fibonacci.js" },
-                },
-              },
-            ],
+            parts: [{ text: "一句话自我介绍。" }],
           },
         },
       ],
@@ -26,11 +19,15 @@ async function testToolUseIdUsesTooluPrefixWhenMissingUpstreamId() {
     },
   };
 
+  // Gemini 在非 thinking 模式下也可能追加一个空文本 part，只携带 thoughtSignature
   const chunk2 = {
     response: {
       candidates: [
         {
-          content: { role: "model", parts: [{ text: "" }] },
+          content: {
+            role: "model",
+            parts: [{ thoughtSignature: "sig_xxx", text: "" }],
+          },
           finishReason: "STOP",
         },
       ],
@@ -45,25 +42,19 @@ async function testToolUseIdUsesTooluPrefixWhenMissingUpstreamId() {
   const transformed = await transformClaudeResponseOut(upstream);
   const out = await transformed.text();
 
-  const match = out.match(/"type":"tool_use","id":"([^"]+)","name":"Read"/);
-  if (!match) {
-    throw new Error(`Expected a tool_use content_block for Read, got:\n${out}`);
-  }
-
-  const toolUseId = match[1];
-  if (!toolUseId.startsWith("toolu_")) {
-    throw new Error(`Expected tool_use.id to start with "toolu_", got: ${toolUseId}`);
+  if (out.includes("\"type\":\"thinking\"") || out.includes("\"type\":\"signature_delta\"")) {
+    throw new Error("Expected no thinking/signature blocks for non-thinking response.");
   }
 }
 
 async function main() {
-  await testToolUseIdUsesTooluPrefixWhenMissingUpstreamId();
+  await testDropTrailingSignatureWithoutThinking();
   // eslint-disable-next-line no-console
-  console.log("✅ test_tooluse_id_prefix: PASS");
+  console.log("✅ test_subagent_signature_drop: PASS");
 }
 
 main().catch((err) => {
   // eslint-disable-next-line no-console
-  console.error("❌ test_tooluse_id_prefix: FAIL\n", err);
+  console.error("❌ test_subagent_signature_drop: FAIL\n", err);
   process.exitCode = 1;
 });
