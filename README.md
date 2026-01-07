@@ -15,6 +15,11 @@
 * Gemini端点支持geminicli(没严格测试)
 * 账号切换等等。
 
+模型路由（默认行为）：
+
+- `claude-haiku-*`：代理到 `gemini-3-flash`
+- `web_search`：强制走 `gemini-2.5-flash`（用于 Antigravity 内置搜索/grounding 行为）
+
 特性：
 
 - **Thought Signatures（思考签名）**：按 Gemini 官方规范透传 `thoughtSignature`，在 thinking / 工具调用等场景中确保下一轮请求能原样带回签名，避免 `missing thought_signature` 类校验错误。
@@ -83,6 +88,13 @@ AG2API_DEBUG=false
 AG2API_LOG_RETENTION_DAYS=3
 AG2API_SWITCH_TO_MCP_MODEL=gemini-3-flash
 AG2API_UPDATE_REPO=znlsl/Antigravity2Api
+
+# Optional: Thought Signatures / multi-instance
+# 1) 多实例或可能重启时，建议配置持久化存储（写入 tool_use.id -> thoughtSignature 的 JSONL 文件）
+# 2) 作为兜底，也可启用 dummy thoughtSignature（会放宽校验，仅建议在多实例/会话漂移场景使用）
+AG2API_THOUGHT_SIGNATURE_STORE_PATH=
+AG2API_THOUGHT_SIGNATURE_DUMMY=
+AG2API_THOUGHT_SIGNATURE_CACHE_MAX=50000
 ```
 
 **配置项说明：**
@@ -96,6 +108,9 @@ AG2API_UPDATE_REPO=znlsl/Antigravity2Api
 - `AG2API_LOG_RETENTION_DAYS`：日志保留天数（默认 3；设为 0 表示不自动清理）
 - `AG2API_SWITCH_TO_MCP_MODEL`：MCP 折中方案开关；为空/不配置表示关闭，配置为 `gemini-*`（如 `gemini-3-flash`）表示在检测到 `AG2API_SWITCH_TO_MCP_MODEL` 信号或 `mcp__*` 工具调用时自动切换并重试
 - `AG2API_UPDATE_REPO`：管理界面版本检查的 GitHub 仓库（默认 `znlsl/Antigravity2Api`，用于获取 latest release）
+- `AG2API_THOUGHT_SIGNATURE_STORE_PATH`：可选；将 `tool_use.id -> thoughtSignature` 追加写入到 JSONL 文件（便于多实例/重启后补回签名）。**多实例时必须把该路径放到共享存储（例如同一个 volume）**。注意该文件可能包含敏感信息，需妥善保护。
+- `AG2API_THOUGHT_SIGNATURE_DUMMY`：可选；当当前 turn 的第一个 `tool_use` 缺失 thoughtSignature 且无法从缓存补回时，注入 dummy 值以绕过校验（值为 `true/1` 时默认使用 `skip_thought_signature_validator`；也可直接设置成具体字符串）。仅建议在多实例/会话漂移导致签名丢失时启用。
+- `AG2API_THOUGHT_SIGNATURE_CACHE_MAX`：可选；内存里缓存的签名条目上限（默认 50000，超过会按插入顺序淘汰最旧条目）。
 
 Google OAuth Client（可选覆盖）：
 
@@ -109,6 +124,15 @@ Google OAuth Client（可选覆盖）：
 ```bash
 npm run start
 ```
+
+## 多实例部署注意事项
+
+本项目为了兼容 Gemini 的 Thought Signatures，会在代理进程内缓存 `tool_use.id -> thoughtSignature`，并在下一轮请求补回签名。多实例部署时如果请求没有粘到同一个实例（没有 sticky session），就可能出现签名缓存丢失，从而触发上游 400（例如 `missing thought_signature`）。
+
+建议（满足其一即可）：
+
+1) 使用 sticky session（按 `metadata.user_id` 或其它会话标识）保证同一会话固定落到同一实例；或
+2) 配置 `AG2API_THOUGHT_SIGNATURE_STORE_PATH` 指向共享存储，让不同实例能互相读取签名；必要时再启用 `AG2API_THOUGHT_SIGNATURE_DUMMY` 作为兜底。
 
 启动后打开管理界面添加/删除账号：
 

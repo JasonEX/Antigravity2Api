@@ -11,6 +11,8 @@
 // 所以需要代理进程内维护一份 tool_use.id -> thoughtSignature 的映射，并在转回 v1internal 时补回。
 const toolThoughtSignatures = new Map(); // tool_use.id -> thoughtSignature
 const crypto = require("crypto");
+const fs = require("fs");
+const path = require("path");
 const { maybeInjectMcpHintIntoSystemText } = require("../../mcp/claudeTransformerMcp");
 
 function makeToolUseId() {
@@ -25,17 +27,202 @@ function isDebugEnabled() {
   return v === "1" || v === "true" || v === "yes" || v === "on";
 }
 
+function getDummyThoughtSignature() {
+  const raw = process.env.AG2API_THOUGHT_SIGNATURE_DUMMY;
+  if (raw === undefined || raw === null) return null;
+  const trimmed = String(raw).trim();
+  if (!trimmed) return null;
+  const lowered = trimmed.toLowerCase();
+  if (lowered === "1" || lowered === "true" || lowered === "yes" || lowered === "on") {
+    return "skip_thought_signature_validator";
+  }
+  return trimmed;
+}
+
+function getThoughtSignatureStorePath() {
+  const raw = process.env.AG2API_THOUGHT_SIGNATURE_STORE_PATH;
+  if (raw === undefined || raw === null) return null;
+  const trimmed = String(raw).trim();
+  if (!trimmed) return null;
+  return path.isAbsolute(trimmed) ? trimmed : path.resolve(process.cwd(), trimmed);
+}
+
+function getThoughtSignatureCacheMax() {
+  const raw = process.env.AG2API_THOUGHT_SIGNATURE_CACHE_MAX;
+  if (raw === undefined || raw === null) return 50000;
+  const n = parseInt(String(raw).trim(), 10);
+  if (!Number.isFinite(n) || n <= 0) return 50000;
+  return n;
+}
+
+function trimToolThoughtSignaturesCache(maxSize) {
+  const max = Number.isFinite(maxSize) ? maxSize : 50000;
+  while (toolThoughtSignatures.size > max) {
+    const oldestKey = toolThoughtSignatures.keys().next().value;
+    if (oldestKey === undefined) break;
+    toolThoughtSignatures.delete(oldestKey);
+  }
+}
+
+let storeStatCache = { mtimeMs: 0, size: 0 };
+
+function readJsonlTailSync(filePath, maxBytes) {
+  const max = Number.isFinite(maxBytes) && maxBytes > 0 ? maxBytes : 4 * 1024 * 1024;
+  let fd;
+  try {
+    fd = fs.openSync(filePath, "r");
+    const stat = fs.fstatSync(fd);
+    const start = Math.max(0, stat.size - max);
+    const len = Math.max(0, stat.size - start);
+    if (len === 0) return "";
+    const buf = Buffer.alloc(len);
+    fs.readSync(fd, buf, 0, len, start);
+    let text = buf.toString("utf8");
+    // If truncated, drop the first partial line.
+    if (start > 0) {
+      const nl = text.indexOf("\n");
+      text = nl >= 0 ? text.slice(nl + 1) : "";
+    }
+    return text;
+  } catch {
+    return "";
+  } finally {
+    if (fd != null) {
+      try {
+        fs.closeSync(fd);
+      } catch {}
+    }
+  }
+}
+
+function refreshToolThoughtSignaturesFromStore() {
+  const filePath = getThoughtSignatureStorePath();
+  if (!filePath) return;
+  let stat;
+  try {
+    stat = fs.statSync(filePath);
+  } catch {
+    return;
+  }
+  if (stat.mtimeMs === storeStatCache.mtimeMs && stat.size === storeStatCache.size) return;
+  storeStatCache = { mtimeMs: stat.mtimeMs, size: stat.size };
+
+  const tailText = readJsonlTailSync(filePath, 4 * 1024 * 1024);
+  if (!tailText) return;
+
+  for (const line of tailText.split("\n")) {
+    const trimmed = line.trim();
+    if (!trimmed) continue;
+    try {
+      const parsed = JSON.parse(trimmed);
+      const id = parsed?.id;
+      const sig = parsed?.sig;
+      if (!id || !sig) continue;
+      toolThoughtSignatures.set(String(id), String(sig));
+    } catch {}
+  }
+
+  trimToolThoughtSignaturesCache(getThoughtSignatureCacheMax());
+}
+
+function appendToolThoughtSignatureToStore(id, sig) {
+  const filePath = getThoughtSignatureStorePath();
+  if (!filePath) return;
+  try {
+    fs.mkdirSync(path.dirname(filePath), { recursive: true });
+  } catch {}
+  const record = JSON.stringify({ id, sig, ts: Date.now() }) + "\n";
+  fs.promises.appendFile(filePath, record).catch(() => {});
+}
+
+function normalizeTextForTurn(text) {
+  return String(text || "").replace(/\s+/g, "");
+}
+
+/**
+ * Gemini thoughtSignature validator only checks within the "current turn":
+ * from the most recent user message that contains standard text content.
+ * See: https://ai.google.dev/gemini-api/docs/thought-signatures
+ *
+ * We intentionally ignore Claude Code's duplicated task text echoed after tool_result
+ * (same heuristic as request-side dedupe) so we don't accidentally "reset" the turn
+ * and drop required signatures for the active toolchain.
+ */
+function findCurrentTurnStartIndex(messages) {
+  if (!Array.isArray(messages) || messages.length === 0) return 0;
+
+  let lastUserTaskTextNormalized = null;
+  let lastTurnStartIndex = 0;
+
+  for (let msgIndex = 0; msgIndex < messages.length; msgIndex++) {
+    const msg = messages[msgIndex];
+    if (!msg || msg.role !== "user") continue;
+
+    let previousWasToolResult = false;
+    let sawRealUserText = false;
+
+    if (Array.isArray(msg.content)) {
+      for (const item of msg.content) {
+        if (!item || typeof item !== "object") continue;
+        if (item.type === "tool_result") {
+          previousWasToolResult = true;
+          continue;
+        }
+        if (item.type === "text") {
+          const text = typeof item.text === "string" ? item.text : "";
+          if (!text || text === "(no content)") {
+            previousWasToolResult = false;
+            continue;
+          }
+          const normalized = normalizeTextForTurn(text);
+          if (!normalized) {
+            previousWasToolResult = false;
+            continue;
+          }
+          if (previousWasToolResult && lastUserTaskTextNormalized && normalized === lastUserTaskTextNormalized) {
+            // Skip duplicated task text echoed after tool_result.
+            previousWasToolResult = false;
+            continue;
+          }
+
+          sawRealUserText = true;
+          lastUserTaskTextNormalized = normalized;
+          previousWasToolResult = false;
+          continue;
+        }
+        previousWasToolResult = false;
+      }
+    } else if (typeof msg.content === "string") {
+      const text = msg.content;
+      const normalized = normalizeTextForTurn(text);
+      if (normalized) {
+        sawRealUserText = true;
+        lastUserTaskTextNormalized = normalized;
+      }
+    }
+
+    if (sawRealUserText) lastTurnStartIndex = msgIndex;
+  }
+
+  return lastTurnStartIndex;
+}
+
 function rememberToolThoughtSignature(toolUseId, thoughtSignature) {
   if (!toolUseId || !thoughtSignature) return;
   const id = String(toolUseId);
   const sig = String(thoughtSignature);
   toolThoughtSignatures.set(id, sig);
+  trimToolThoughtSignaturesCache(getThoughtSignatureCacheMax());
+  appendToolThoughtSignatureToStore(id, sig);
   if (isDebugEnabled()) console.log(`[ThoughtSignature] cached tool_use.id=${id} len=${sig.length}`);
 }
 
 function getToolThoughtSignature(toolUseId) {
   if (!toolUseId) return null;
   const id = String(toolUseId);
+  const cached = toolThoughtSignatures.get(id);
+  if (cached) return cached;
+  refreshToolThoughtSignaturesFromStore();
   return toolThoughtSignatures.get(id) || null;
 }
 
@@ -766,9 +953,9 @@ function mapClaudeModelToGemini(claudeModel) {
     "claude-opus-4": "claude-opus-4-5-thinking",
     "claude-opus-4-5-20251101": "claude-opus-4-5-thinking",
     "claude-opus-4-5": "claude-opus-4-5-thinking",
-    "claude-haiku-4": "claude-sonnet-4-5",
-    "claude-3-haiku-20240307": "claude-sonnet-4-5",
-    "claude-haiku-4-5-20251001": "claude-sonnet-4-5",
+    "claude-haiku-4": "gemini-3-flash",
+    "claude-3-haiku-20240307": "gemini-3-flash",
+    "claude-haiku-4-5-20251001": "gemini-3-flash",
     "gemini-2.5-flash": "gemini-2.5-flash",
     "gemini-3-flash": "gemini-3-flash"
   };
@@ -801,6 +988,11 @@ function transformClaudeRequestIn(claudeReq, projectId, options = {}) {
   const signatureSegmentStartIndex = Number.isInteger(options?.signatureSegmentStartIndex)
     ? options.signatureSegmentStartIndex
     : null;
+  const currentTurnStartIndex = findCurrentTurnStartIndex(claudeReq?.messages);
+  const effectiveSignatureSegmentStartIndex =
+    signatureSegmentStartIndex == null
+      ? currentTurnStartIndex
+      : Math.max(signatureSegmentStartIndex, currentTurnStartIndex);
 
   // 记录 tool_use id 到 name 的映射，便于后续 tool_result 还原函数名
   const toolIdToName = new Map();
@@ -848,7 +1040,7 @@ function transformClaudeRequestIn(claudeReq, projectId, options = {}) {
       const msg = claudeReq.messages[msgIndex];
       const shouldForwardThoughtSignatures =
         forwardThoughtSignaturesByDefault &&
-        (signatureSegmentStartIndex == null || msgIndex >= signatureSegmentStartIndex);
+        msgIndex >= effectiveSignatureSegmentStartIndex;
       let role = msg.role;
       if (role === "assistant") {
         role = "model";
@@ -859,6 +1051,7 @@ function transformClaudeRequestIn(claudeReq, projectId, options = {}) {
       // thinking block after any non-thinking content (text/tool/image/etc), drop it to avoid invalid
       // thought parts (and leaking late "thinking" as plain text).
       let sawNonThinkingContent = false;
+      let sawToolUseInMessage = false;
       let previousWasToolResult = false;
       
       if (Array.isArray(msg.content)) {
@@ -944,6 +1137,8 @@ function transformClaudeRequestIn(claudeReq, projectId, options = {}) {
             previousWasToolResult = false;
           } else if (item.type === "tool_use") {
             // 根据官方文档：签名必须在收到签名的那个 functionCall part 上原样返回
+            const isFirstToolUseInMessage = !sawToolUseInMessage;
+            sawToolUseInMessage = true;
             const fcPart = {
               functionCall: {
                 name: item.name,
@@ -961,6 +1156,16 @@ function transformClaudeRequestIn(claudeReq, projectId, options = {}) {
               fcPart.thoughtSignature = sig;
               if (!item.signature && isDebugEnabled()) {
                 console.log(`[ThoughtSignature] injected tool_use.id=${item.id}`);
+              }
+            } else if (!sig && shouldForwardThoughtSignatures && isFirstToolUseInMessage) {
+              const dummy = getDummyThoughtSignature();
+              if (dummy) {
+                fcPart.thoughtSignature = dummy;
+                if (isDebugEnabled()) {
+                  console.log(
+                    `[ThoughtSignature] missing tool_use signature; using dummy for id=${item.id || "unknown"}`
+                  );
+                }
               }
             }
             clientContent.parts.push(fcPart);
