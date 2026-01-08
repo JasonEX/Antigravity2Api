@@ -1,10 +1,37 @@
 const crypto = require("crypto");
 
-const V1INTERNAL_BASE_URL = "https://cloudcode-pa.googleapis.com/v1internal";
+const { ANTIGRAVITY_SYSTEM_PROMPT } = require("../prompts/antigravitySystemPrompt");
 
-function buildV1InternalUrl(method, queryString = "") {
+const DEFAULT_V1INTERNAL_BASE_URLS = [
+  "https://daily-cloudcode-pa.sandbox.googleapis.com/v1internal",
+  "https://daily-cloudcode-pa.googleapis.com/v1internal",
+  "https://cloudcode-pa.googleapis.com/v1internal",
+];
+
+function normalizeV1InternalBaseUrl(baseUrl) {
+  const raw = String(baseUrl || "").trim();
+  if (!raw) return "";
+  const trimmed = raw.replace(/\/+$/, "");
+  if (trimmed.endsWith("/v1internal")) return trimmed;
+  return `${trimmed}/v1internal`;
+}
+
+function getV1InternalBaseUrlCandidates() {
+  const custom =
+    process.env.AG2API_V1INTERNAL_BASE_URL ||
+    process.env.AG2API_BASE_URL ||
+    process.env.V1INTERNAL_BASE_URL;
+  if (custom && String(custom).trim()) {
+    const normalized = normalizeV1InternalBaseUrl(custom);
+    return normalized ? [normalized] : DEFAULT_V1INTERNAL_BASE_URLS;
+  }
+  return DEFAULT_V1INTERNAL_BASE_URLS;
+}
+
+function buildV1InternalUrl(method, queryString = "", baseUrl) {
+  const resolvedBaseUrl = baseUrl || DEFAULT_V1INTERNAL_BASE_URLS[0];
   const qs = queryString ? String(queryString) : "";
-  return `${V1INTERNAL_BASE_URL}:${method}${qs}`;
+  return `${resolvedBaseUrl}:${method}${qs}`;
 }
 
 // OAuth client configuration: allow env override, fallback to built-in defaults (same as Antigravity2api)
@@ -31,9 +58,32 @@ async function waitForApiSlot(limiter) {
   }
 }
 
+function ensureAntigravitySystemInstruction(body) {
+  if (!body || typeof body !== "object") return;
+  const req = body.request;
+  if (!req || typeof req !== "object") return;
+
+  if (!req.systemInstruction || typeof req.systemInstruction !== "object") {
+    req.systemInstruction = { role: "user", parts: [{ text: ANTIGRAVITY_SYSTEM_PROMPT }] };
+    return;
+  }
+
+  req.systemInstruction.role = "user";
+  if (!Array.isArray(req.systemInstruction.parts)) {
+    req.systemInstruction.parts = [];
+  }
+
+  if (
+    req.systemInstruction.parts.length === 0 ||
+    req.systemInstruction.parts[0]?.text !== ANTIGRAVITY_SYSTEM_PROMPT
+  ) {
+    req.systemInstruction.parts.unshift({ text: ANTIGRAVITY_SYSTEM_PROMPT });
+  }
+}
+
 /**
  * Raw v1internal call helper.
- * This is the single place where cloudcode-pa.googleapis.com/v1internal is fetched.
+ * This is the single place where v1internal is fetched (with base URL fallbacks).
  *
  * @param {string} method - v1internal method name (e.g. "generateContent", "countTokens")
  * @param {string} accessToken
@@ -50,31 +100,68 @@ async function callV1Internal(method, accessToken, body, options = {}) {
   const limiter = options.limiter;
 
   await waitForApiSlot(limiter);
-  return fetch(buildV1InternalUrl(method, queryString), {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-      Authorization: `Bearer ${accessToken}`,
-      "User-Agent": "antigravity/1.11.9 windows/amd64",
-      ...extraHeaders,
-    },
-    body: JSON.stringify(body || {}),
-  });
+
+  // Ensure Antigravity defaults for agent requests.
+  const needsSystemPrompt = method === "generateContent" || method === "streamGenerateContent";
+  if (needsSystemPrompt) {
+    if (body && typeof body === "object") {
+      if (!body.userAgent) body.userAgent = "antigravity";
+      if (!body.requestType) body.requestType = "agent";
+      ensureAntigravitySystemInstruction(body);
+    }
+  }
+
+  const baseUrls = getV1InternalBaseUrlCandidates();
+  let last429 = null;
+  let lastErr = null;
+
+  for (let i = 0; i < baseUrls.length; i++) {
+    const baseUrl = baseUrls[i];
+    try {
+      const resp = await fetch(buildV1InternalUrl(method, queryString, baseUrl), {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          Authorization: `Bearer ${accessToken}`,
+          "User-Agent": "antigravity/1.11.9 windows/amd64",
+          ...extraHeaders,
+        },
+        body: JSON.stringify(body || {}),
+      });
+
+      if (resp.status === 429 && i + 1 < baseUrls.length) {
+        last429 = resp;
+        try {
+          resp.body?.cancel();
+        } catch (_) {}
+        continue;
+      }
+
+      return resp;
+    } catch (err) {
+      lastErr = err;
+      if (i + 1 < baseUrls.length) continue;
+      throw err;
+    }
+  }
+
+  if (last429) return last429;
+  throw lastErr || new Error("v1internal: no base URL available");
 }
 
 async function fetchProjectId(accessToken, limiter) {
-  await waitForApiSlot(limiter);
-  const response = await fetch(buildV1InternalUrl("loadCodeAssist"), {
-    method: "POST",
-    headers: {
-      Host: "cloudcode-pa.googleapis.com",
-      "User-Agent": "antigravity/1.11.9 windows/amd64",
-      Authorization: `Bearer ${accessToken}`,
-      "Content-Type": "application/json",
-      "Accept-Encoding": "gzip",
-    },
-    body: JSON.stringify({ metadata: { ideType: "ANTIGRAVITY" } }),
-  });
+  const response = await callV1Internal(
+    "loadCodeAssist",
+    accessToken,
+    { metadata: { ideType: "ANTIGRAVITY" } },
+    {
+      limiter,
+      headers: {
+        // Preserve prior behavior.
+        "Accept-Encoding": "gzip",
+      },
+    }
+  );
 
   const rawBody = await response.text().catch(() => "");
 
@@ -93,16 +180,7 @@ async function fetchProjectId(accessToken, limiter) {
 }
 
 async function fetchAvailableModels(accessToken, limiter) {
-  await waitForApiSlot(limiter);
-  const response = await fetch(buildV1InternalUrl("fetchAvailableModels"), {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-      Authorization: `Bearer ${accessToken}`,
-      "User-Agent": "antigravity/1.11.9 windows/amd64",
-    },
-    body: JSON.stringify({}),
-  });
+  const response = await callV1Internal("fetchAvailableModels", accessToken, {}, { limiter });
 
   if (!response.ok) {
     throw new Error(`Failed to fetch models: ${response.status} ${response.statusText}`);
