@@ -99,24 +99,45 @@ class UpstreamClient {
   }
 
   parseRetryDelayMs(errText) {
+    const raw = typeof errText === "string" ? errText : "";
+
+    const parseRetryAfterSecondsFromText = (text) => {
+      if (typeof text !== "string") return null;
+      const m = text.match(/after\s+(\d+(?:\.\d+)?)s\.?/i);
+      if (!m) return null;
+      const ms = this.parseDurationMs(`${m[1]}s`);
+      return ms != null ? ms : null;
+    };
+
+    let errObj;
     try {
-      const errObj = JSON.parse(errText);
-      const details = errObj.error?.details || [];
+      errObj = JSON.parse(raw);
+    } catch (_) {
+      // Fallback: parse from plain text body.
+      return parseRetryAfterSecondsFromText(raw);
+    }
 
-      // RetryInfo.retryDelay like "1.203608125s"
-      const retryInfo = details.find((d) => d["@type"]?.includes("RetryInfo"));
-      if (retryInfo?.retryDelay) {
-        const ms = this.parseDurationMs(retryInfo.retryDelay);
-        if (ms != null) return ms;
-      }
+    const details = errObj.error?.details || [];
 
-      // quotaResetDelay like "331.167174ms" or "1h16m0.667923083s"
-      const metaDelay = details.find((d) => d.metadata?.quotaResetDelay)?.metadata?.quotaResetDelay;
-      if (metaDelay) {
-        const ms = this.parseDurationMs(metaDelay);
-        if (ms != null) return ms;
-      }
-    } catch (_) {}
+    // RetryInfo.retryDelay like "1.203608125s"
+    const retryInfo = details.find((d) => d["@type"]?.includes("RetryInfo"));
+    if (retryInfo?.retryDelay) {
+      const ms = this.parseDurationMs(retryInfo.retryDelay);
+      if (ms != null) return ms;
+    }
+
+    // quotaResetDelay like "331.167174ms" or "1h16m0.667923083s"
+    const metaDelay = details.find((d) => d.metadata?.quotaResetDelay)?.metadata?.quotaResetDelay;
+    if (metaDelay) {
+      const ms = this.parseDurationMs(metaDelay);
+      if (ms != null) return ms;
+    }
+
+    // Fallback: parse from error.message "Your quota will reset after Xs."
+    const message = errObj.error?.message;
+    const msgMs = parseRetryAfterSecondsFromText(message);
+    if (msgMs != null) return msgMs;
+
     return null;
   }
 

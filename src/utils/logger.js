@@ -150,6 +150,15 @@ function truncateString(str, maxLen = 200) {
 function formatLogContent(data, options = {}) {
   const { indent = 2, maxDepth = 4, compact = false } = options;
   
+  if (data instanceof Error) {
+    const payload = {
+      name: data.name,
+      message: data.message,
+      ...(data.stack ? { stack: data.stack } : {}),
+    };
+    return JSON.stringify(payload, null, compact ? 0 : indent);
+  }
+
   if (typeof data === "string") {
     try {
       const parsed = JSON.parse(data);
@@ -258,11 +267,69 @@ function createLogger(options = {}) {
 
   /**
    * 核心日志函数
-   * @param {string} level - 日志级别
-   * @param {string} message - 日志消息
-   * @param {object} [meta] - 附加元数据
+   * 兼容调用方式：
+   * - log(level, message, meta)（新）
+   * - log(title, data)（旧，常见于历史代码）
    */
-  const log = (level, message, meta = null) => {
+  const toPlainError = (err) => ({
+    name: err?.name,
+    message: err?.message,
+    ...(err?.stack ? { stack: err.stack } : {}),
+  });
+
+  const isKnownLevel = (value) => {
+    if (typeof value !== "string") return false;
+    return Object.prototype.hasOwnProperty.call(LogLevels, value);
+  };
+
+  const pickMessageFromMeta = (value) => {
+    if (!value || typeof value !== "object") return "";
+    if (value instanceof Error) return value.message || "Error";
+    const keys = ["message", "action", "event", "reason", "name", "type"];
+    for (const k of keys) {
+      const v = value[k];
+      if (typeof v === "string" && v.trim()) return v.trim();
+    }
+    return "";
+  };
+
+  const normalizeLogArgs = (rawArgs) => {
+    const [a0, a1, a2] = rawArgs;
+
+    // New signature: log(level, message, meta)
+    if (rawArgs.length >= 3 && isKnownLevel(a0)) {
+      const msg = typeof a1 === "string" ? a1 : a1 != null ? String(a1) : "";
+      const meta = a2 instanceof Error ? toPlainError(a2) : a2 ?? null;
+      return { level: a0, message: msg, meta };
+    }
+
+    // Legacy signature: log(title, data)
+    if (!isKnownLevel(a0)) {
+      const title = a0 != null ? String(a0) : "";
+      if (rawArgs.length >= 3) {
+        return { level: "info", message: title, meta: { data: a1, meta: a2 } };
+      }
+      const meta = a1 instanceof Error ? toPlainError(a1) : a1 ?? null;
+      return { level: "info", message: title, meta };
+    }
+
+    // Known level with (level, message) or (level, meta)
+    const level = a0;
+    if (typeof a1 === "string") {
+      return { level, message: a1, meta: null };
+    }
+    if (a1 instanceof Error) {
+      return { level, message: a1.message || "Error", meta: toPlainError(a1) };
+    }
+    if (a1 && typeof a1 === "object") {
+      const msg = pickMessageFromMeta(a1);
+      return { level, message: msg, meta: a1 };
+    }
+    return { level, message: a1 != null ? String(a1) : "", meta: null };
+  };
+
+  const log = (...args) => {
+    const { level, message, meta } = normalizeLogArgs(args);
     const levelConfig = LogLevels[level] || LogLevels.info;
     
     // 过滤低优先级日志
@@ -283,7 +350,8 @@ function createLogger(options = {}) {
     const coloredLevel = `${levelConfig.color}${levelConfig.label.padEnd(8)}${Colors.reset}`;
     const timeStr = `${Colors.gray}[${timestamp}]${Colors.reset}`;
     
-    let consoleOutput = `${timeStr} ${icon} ${coloredLevel} ${message}`;
+    const safeMessage = typeof message === "string" ? message : message != null ? String(message) : "";
+    let consoleOutput = `${timeStr} ${icon} ${coloredLevel} ${safeMessage}`;
     
     // 如果有元数据，格式化输出
     if (meta !== null && meta !== undefined) {
@@ -304,7 +372,7 @@ function createLogger(options = {}) {
     // 文件日志（纯文本，无颜色）
     const separator = "-".repeat(60);
     const metaContent = meta !== null && meta !== undefined ? formatLogContent(meta) : "";
-    const fileEntry = `[${fullTimestamp}] [${levelConfig.label}] ${message}\n${metaContent ? metaContent + "\n" : ""}${separator}\n`;
+    const fileEntry = `[${fullTimestamp}] [${levelConfig.label}] ${safeMessage}\n${metaContent ? metaContent + "\n" : ""}${separator}\n`;
     
     fs.appendFile(logFile, fileEntry, (err) => {
       if (err) console.error("Failed to write to log file:", err);

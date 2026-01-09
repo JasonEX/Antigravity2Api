@@ -166,6 +166,10 @@ function wrapRequest(clientJson, options) {
     }
   }
 
+  if (!innerRequest.generationConfig || typeof innerRequest.generationConfig !== "object" || Array.isArray(innerRequest.generationConfig)) {
+    innerRequest.generationConfig = {};
+  }
+
   // Match current behavior: force maxOutputTokens
   innerRequest.generationConfig.maxOutputTokens = 65535;
 

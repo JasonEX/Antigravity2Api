@@ -34,25 +34,32 @@ class ClaudeApi {
     this.sessionMcpState = new Map(); // sessionId -> { lastFamily, mcpStartIndex, foldedSegments: [] }
   }
 
-  log(title, data) {
+  log(title, data, meta) {
     if (this.logger) {
       if (typeof this.logger.log === "function") {
-        return this.logger.log(title, data);
+        return this.logger.log(title, data, meta);
       }
       if (typeof this.logger === "function") {
-        return this.logger(title, data);
+        return this.logger(title, data, meta);
       }
     }
-    if (data !== undefined && data !== null) {
-      console.log(`[${title}]`, typeof data === "string" ? data : JSON.stringify(data, null, 2));
-    } else {
-      console.log(`[${title}]`);
+
+    if (meta !== undefined) {
+      const outData = data !== undefined && data !== null ? (typeof data === "string" ? data : JSON.stringify(data, null, 2)) : "";
+      const outMeta = meta !== undefined && meta !== null ? (typeof meta === "string" ? meta : JSON.stringify(meta, null, 2)) : "";
+      if (outData || outMeta) return console.log(`[${title}]`, outData, outMeta);
+      return console.log(`[${title}]`);
     }
+
+    if (data !== undefined && data !== null) {
+      return console.log(`[${title}]`, typeof data === "string" ? data : JSON.stringify(data, null, 2));
+    }
+    return console.log(`[${title}]`);
   }
 
   logDebug(title, data) {
     if (!this.debugRequestResponse) return;
-    this.log("debug", `${title}`, data);
+    this.log("debug", title, data);
   }
 
   logStream(event, options = {}) {

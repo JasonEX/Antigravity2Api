@@ -1,6 +1,6 @@
 const crypto = require("crypto");
 
-const { ANTIGRAVITY_SYSTEM_PROMPT } = require("../prompts/antigravitySystemPrompt");
+const { ensureAntigravitySystemInstruction } = require("./antigravitySystemInstruction");
 
 const DEFAULT_V1INTERNAL_BASE_URLS = [
   "https://daily-cloudcode-pa.sandbox.googleapis.com/v1internal",
@@ -55,29 +55,6 @@ function getOAuthClient() {
 async function waitForApiSlot(limiter) {
   if (limiter && typeof limiter.wait === "function") {
     await limiter.wait();
-  }
-}
-
-function ensureAntigravitySystemInstruction(body) {
-  if (!body || typeof body !== "object") return;
-  const req = body.request;
-  if (!req || typeof req !== "object") return;
-
-  if (!req.systemInstruction || typeof req.systemInstruction !== "object") {
-    req.systemInstruction = { role: "user", parts: [{ text: ANTIGRAVITY_SYSTEM_PROMPT }] };
-    return;
-  }
-
-  req.systemInstruction.role = "user";
-  if (!Array.isArray(req.systemInstruction.parts)) {
-    req.systemInstruction.parts = [];
-  }
-
-  if (
-    req.systemInstruction.parts.length === 0 ||
-    req.systemInstruction.parts[0]?.text !== ANTIGRAVITY_SYSTEM_PROMPT
-  ) {
-    req.systemInstruction.parts.unshift({ text: ANTIGRAVITY_SYSTEM_PROMPT });
   }
 }
 
