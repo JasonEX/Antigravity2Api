@@ -1,5 +1,11 @@
 const { GeminiApi } = require("../src/api");
 
+const noop = () => {};
+const testLogger = {
+  log: noop,
+  logStream: noop,
+};
+
 async function testRejectsMissingSignatureOnModelImagePart() {
   let upstreamCalled = false;
   const geminiApi = new GeminiApi({
@@ -9,6 +15,7 @@ async function testRejectsMissingSignatureOnModelImagePart() {
         throw new Error("Upstream should not be called for invalid requests");
       },
     },
+    logger: testLogger,
   });
 
   const clientBody = {
@@ -52,6 +59,7 @@ async function testAllowsSignedModelImagePart() {
         );
       },
     },
+    logger: testLogger,
   });
 
   const clientBody = {

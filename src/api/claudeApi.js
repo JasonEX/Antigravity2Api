@@ -1,5 +1,7 @@
 const { transformClaudeRequestIn, transformClaudeResponseOut, mapClaudeModelToGemini } = require("../transform/claude");
+const { ensureLogger } = require("../utils/logger");
 const { getMcpSwitchModel } = require("../mcp/mcpSwitchFlag");
+const { isMcpXmlEnabled, getMcpToolNames } = require("../mcp/mcpXmlBridge");
 const {
   prepareMcpContext,
   bufferForMcpSwitchAndMaybeRetry,
@@ -13,6 +15,11 @@ function hasWebSearchTool(claudeReq) {
 function inferFinalModelForQuota(claudeReq) {
   if (hasWebSearchTool(claudeReq)) return "gemini-2.5-flash";
   return mapClaudeModelToGemini(claudeReq?.model);
+}
+
+function shouldForceStreamForNonStreamingModel(modelName) {
+  const name = String(modelName || "").toLowerCase();
+  return name.includes("claude") || name.includes("gemini-3-pro");
 }
 
 function headersToObject(headers) {
@@ -29,44 +36,18 @@ function headersToObject(headers) {
 class ClaudeApi {
   constructor(options = {}) {
     this.upstream = options.upstreamClient;
-    this.logger = options.logger || null;
+    this.logger = ensureLogger(options.logger);
     this.debugRequestResponse = !!options.debug;
     this.sessionMcpState = new Map(); // sessionId -> { lastFamily, mcpStartIndex, foldedSegments: [] }
   }
 
-  log(title, data, meta) {
-    if (this.logger) {
-      if (typeof this.logger.log === "function") {
-        return this.logger.log(title, data, meta);
-      }
-      if (typeof this.logger === "function") {
-        return this.logger(title, data, meta);
-      }
-    }
-
-    if (meta !== undefined) {
-      const outData = data !== undefined && data !== null ? (typeof data === "string" ? data : JSON.stringify(data, null, 2)) : "";
-      const outMeta = meta !== undefined && meta !== null ? (typeof meta === "string" ? meta : JSON.stringify(meta, null, 2)) : "";
-      if (outData || outMeta) return console.log(`[${title}]`, outData, outMeta);
-      return console.log(`[${title}]`);
-    }
-
-    if (data !== undefined && data !== null) {
-      return console.log(`[${title}]`, typeof data === "string" ? data : JSON.stringify(data, null, 2));
-    }
-    return console.log(`[${title}]`);
-  }
-
   logDebug(title, data) {
     if (!this.debugRequestResponse) return;
-    this.log("debug", title, data);
+    this.logger.log("debug", title, data);
   }
 
   logStream(event, options = {}) {
-    if (this.logger && typeof this.logger.logStream === "function") {
-      return this.logger.logStream(event, options);
-    }
-    this.log("stream", { event, ...options });
+    return this.logger.logStream(event, options);
   }
 
   async logStreamContent(stream, label) {
@@ -82,10 +63,10 @@ class ClaudeApi {
         bufferStr += chunkStr;
       }
       if (bufferStr) {
-        this.log(`${label}`, bufferStr);
+        this.logger.log("debug", String(label), bufferStr);
       }
     } catch (err) {
-      this.log("warn", `Raw stream log failed for ${label}: ${err.message || err}`);
+      this.logger.log("warn", `Raw stream log failed for ${label}: ${err.message || err}`);
     }
     return stream;
   }
@@ -96,10 +77,23 @@ class ClaudeApi {
       const now = Math.floor(Date.now() / 1000);
       const models = [];
 
-      for (const id of Object.keys(remoteModelsMap)) {
-        if (id && id.toLowerCase().includes("claude")) {
-          models.push({ id, object: "model", created: now, owned_by: "anthropic" });
-        }
+      const entries = Array.isArray(remoteModelsMap)
+        ? remoteModelsMap
+        : Object.keys(remoteModelsMap || {}).map((id) => {
+            const info = remoteModelsMap[id];
+            return typeof info === "object" ? { id, ...info } : { id };
+          });
+
+      for (const entry of entries) {
+        const rawId =
+          (typeof entry === "object" && (entry.id || entry.name || entry.model)) ||
+          (typeof entry === "string" ? entry : null);
+        if (!rawId || typeof rawId !== "string") continue;
+
+        const id = rawId.startsWith("models/") ? rawId.slice("models/".length) : rawId;
+        const lower = id.toLowerCase();
+        const ownedBy = lower.includes("claude") ? "anthropic" : lower.includes("gemini") ? "google" : "unknown";
+        models.push({ id, object: "model", created: now, owned_by: ownedBy });
       }
 
       return {
@@ -126,7 +120,7 @@ class ClaudeApi {
         };
       }
 
-      this.log("Claude CountTokens Request", requestData);
+      this.logger.log("info", "Claude CountTokens Request", requestData);
 
       // projectId is not required for countTokens, but transform reuses Claude->v1internal mapping to build contents/model.
       const { body: finalBody } = transformClaudeRequestIn(requestData, "");
@@ -137,7 +131,7 @@ class ClaudeApi {
           contents: finalBody.request.contents || [],
         },
       };
-      this.log("CountTokens Request Body", countTokensBody);
+      this.logger.log("info", "CountTokens Request Body", countTokensBody);
 
       const countTokensResp = await this.upstream.countTokens(countTokensBody, { model: finalBody.model });
       if (!countTokensResp.ok) {
@@ -149,7 +143,7 @@ class ClaudeApi {
       }
 
       const data = await countTokensResp.json();
-      this.log("CountTokens Response", data);
+      this.logger.log("info", "CountTokens Response", data);
 
       let totalTokens = data.totalTokens || 0;
 
@@ -158,19 +152,19 @@ class ClaudeApi {
         try {
           const toolsStr = JSON.stringify(finalBody.request.tools);
           const toolsTokenCount = Math.floor(toolsStr.length / 4);
-          this.log("info", `本地估算 Tools Token: ${toolsTokenCount}`);
+          this.logger.log("info", `本地估算 Tools Token: ${toolsTokenCount}`);
           totalTokens += toolsTokenCount;
         } catch (e) {
-          this.log("error", `Tools token estimation failed: ${e.message || e}`);
+          this.logger.log("error", `Tools token estimation failed: ${e.message || e}`);
         }
       }
 
       const result = { input_tokens: totalTokens };
-      this.log("CountTokens Result", result);
+      this.logger.log("info", "CountTokens Result", result);
 
       return { status: 200, headers: { "Content-Type": "application/json" }, body: result };
     } catch (error) {
-      this.log("Error processing CountTokens", error.message || error);
+      this.logger.log("error", "Error processing CountTokens", error.message || error);
       return {
         status: 500,
         headers: { "Content-Type": "application/json" },
@@ -191,8 +185,7 @@ class ClaudeApi {
 
       this.logDebug("Claude Payload Request", requestData);
 
-      const method = requestData.stream ? "streamGenerateContent" : "generateContent";
-      const queryString = requestData.stream ? "?alt=sse" : "";
+      const clientWantsStream = !!requestData.stream;
 
       const mcpModel = getMcpSwitchModel();
       let baseModel = requestData.model;
@@ -210,6 +203,19 @@ class ClaudeApi {
             mcpModel,
             inferFinalModelForQuota,
           }));
+      }
+
+      const forceStreamForNonStreaming =
+        !clientWantsStream && shouldForceStreamForNonStreamingModel(modelForQuota);
+      const method = clientWantsStream || forceStreamForNonStreaming ? "streamGenerateContent" : "generateContent";
+      const queryString = method === "streamGenerateContent" ? "?alt=sse" : "";
+
+      const transformOutOptions = {};
+      if (mcpModel) transformOutOptions.overrideModel = baseModel;
+      if (!clientWantsStream && method === "streamGenerateContent") transformOutOptions.forceNonStreaming = true;
+      if (isMcpXmlEnabled()) {
+        const names = getMcpToolNames(requestData?.tools);
+        if (names.length > 0) transformOutOptions.mcpXmlToolNames = names;
       }
 
       let loggedTransformed = false;
@@ -236,14 +242,14 @@ class ClaudeApi {
           try {
             if (typeof response.body.tee === "function") {
               const [logBranch, processBranch] = response.body.tee();
-              this.logStreamContent(logBranch, `Upstream Error Raw (Stream, HTTP ${response.status})`);
+              this.logStreamContent(logBranch, `Upstream Error Raw (HTTP ${response.status})`);
               body = processBranch;
             } else {
               const errorText = await response.clone().text().catch(() => "");
-              if (errorText) this.log(`Upstream Error Body (HTTP ${response.status})`, errorText);
+              if (errorText) this.logger.log("debug", `Upstream Error Body (HTTP ${response.status})`, errorText);
             }
           } catch (e) {
-            this.log("warn", `Failed to log upstream error body: ${e.message || e}`);
+            this.logger.log("warn", `Failed to log upstream error body: ${e.message || e}`);
           }
         }
 
@@ -259,20 +265,21 @@ class ClaudeApi {
       if (this.debugRequestResponse && response.body) {
         try {
           const [logBranch, processBranch] = response.body.tee();
-          this.logStreamContent(logBranch, "Gemini Response Raw (Stream)");
+          const rawLabel = method === "streamGenerateContent" ? "Gemini Response Raw (Stream)" : "Gemini Response Raw";
+          this.logStreamContent(logBranch, rawLabel);
           responseForTransform = new Response(processBranch, {
             status: response.status,
             statusText: response.statusText,
             headers: response.headers,
           });
         } catch (e) {
-          this.log("Error teeing stream for logging", e.message || e);
+          this.logger.log("warn", "Error teeing stream for logging", e.message || e);
         }
       }
 
       const convertedResponse = await transformClaudeResponseOut(
         responseForTransform,
-        mcpModel ? { overrideModel: baseModel } : undefined,
+        transformOutOptions,
       );
 
       let finalResponseBody = convertedResponse.body;
@@ -288,9 +295,7 @@ class ClaudeApi {
           convertedResponse,
           shouldBufferForSwitch,
           debugRequestResponse: this.debugRequestResponse,
-          log: (title, data) => this.log(title, data),
-          logDebug: (title, data) => this.logDebug(title, data),
-          logStreamContent: (stream, label) => this.logStreamContent(stream, label),
+          logger: this.logger,
           sessionState,
         });
         if (bufferedResult?.apiResponse) return bufferedResult.apiResponse;
@@ -302,7 +307,7 @@ class ClaudeApi {
             this.logStreamContent(logBranch, "Claude Response Payload (Transformed Stream)");
             finalResponseBody = processBranch;
           } catch (e) {
-            this.log("Error teeing converted stream for logging", e.message || e);
+            this.logger.log("warn", "Error teeing converted stream for logging", e.message || e);
           }
         }
 
@@ -313,7 +318,7 @@ class ClaudeApi {
           this.logStreamContent(logBranch, "Claude Response Payload (Transformed Stream)");
           finalResponseBody = processBranch;
         } catch (e) {
-          this.log("Error teeing converted stream for logging", e.message || e);
+          this.logger.log("warn", "Error teeing converted stream for logging", e.message || e);
         }
       }
 
@@ -327,7 +332,7 @@ class ClaudeApi {
         body: finalResponseBody,
       };
     } catch (error) {
-      this.log("Error processing Claude request", error.message || error);
+      this.logger.log("error", "Error processing Claude request", error.message || error);
       return {
         status: 500,
         headers: { "Content-Type": "application/json" },

@@ -11,24 +11,12 @@ function getRandom5Port(min = 50000, max = 59999) {
 class OAuthFlow {
   constructor(options = {}) {
     this.authManager = options.authManager || null;
-    this.logger = options.logger || null;
+    this.logger = options.logger;
     this.rateLimiter = options.rateLimiter || null;
     this._notifyOAuthDone = null;
-  }
 
-  log(title, data) {
-    if (this.logger) {
-      if (typeof this.logger.log === "function") {
-        return this.logger.log(title, data);
-      }
-      if (typeof this.logger === "function") {
-        return this.logger(title, data);
-      }
-    }
-    if (data !== undefined && data !== null) {
-      console.log(`[${title}]`, typeof data === "string" ? data : JSON.stringify(data, null, 2));
-    } else {
-      console.log(`[${title}]`);
+    if (!this.logger || typeof this.logger.log !== "function") {
+      throw new Error("OAuthFlow requires options.logger with .log(level, message, meta)");
     }
   }
 
@@ -277,15 +265,15 @@ class OAuthFlow {
             try {
               const creds = await this.exchangeCode(code, port);
               await this.authManager.addAccount(creds);
-              this.log("info", "✅ Authorization successful.");
+              this.logger.log("info", "✅ Authorization successful.");
               finish(true);
             } catch (err) {
-              this.log("error", `Failed to exchange code: ${err.message || err}`);
+              this.logger.log("error", `Failed to exchange code: ${err.message || err}`);
             }
           };
 
           const authUrl = this.getAuthUrl(port);
-          this.log("info", `👉 Please open the following URL in your browser to authorize:\n${authUrl}\n`);
+          this.logger.log("info", `👉 Please open the following URL in your browser to authorize:\n${authUrl}\n`);
 
           if (process.platform === "win32") {
             exec(`start "" "${authUrl}"`);
@@ -295,29 +283,29 @@ class OAuthFlow {
           }
 
           rl = readline.createInterface({ input: process.stdin, output: process.stdout });
-          this.log("info", "ℹ️ 如在其他设备授权，请粘贴完整的回调链接并回车；或直接等待浏览器自动回调。");
+          this.logger.log("info", "ℹ️ 如在其他设备授权，请粘贴完整的回调链接并回车；或直接等待浏览器自动回调。");
           rl.on("line", (line) => {
             if (completed) return;
             const trimmed = (line || "").trim();
             if (!trimmed) {
-              this.log("info", "继续等待浏览器回调或粘贴链接...");
+              this.logger.log("info", "继续等待浏览器回调或粘贴链接...");
               return;
             }
             try {
               const url = new URL(trimmed);
               const code = url.searchParams.get("code");
               if (!code) {
-                this.log("warn", "未找到 code 参数，请粘贴完整的回调 URL。");
+                this.logger.log("warn", "未找到 code 参数，请粘贴完整的回调 URL。");
                 return;
               }
               handleCode(code);
             } catch (e) {
-              this.log("warn", "无效的 URL，请粘贴完整的回调 URL。");
+              this.logger.log("warn", "无效的 URL，请粘贴完整的回调 URL。");
             }
           });
         })
         .catch((err) => {
-          this.log("error", `Failed to start OAuth callback server: ${err.message || err}`);
+          this.logger.log("error", `Failed to start OAuth callback server: ${err.message || err}`);
           resolve(false);
         });
     });

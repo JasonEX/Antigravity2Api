@@ -55,6 +55,9 @@ function collectToolResultIdsAfterLastAssistant(claudeReq) {
   for (let i = startIndex; i < claudeReq.messages.length; i++) {
     const msg = claudeReq.messages[i];
     if (!Array.isArray(msg?.content)) continue;
+    const text = extractTextFromClaudeContent(msg.content);
+    // Interrupted placeholder tool_result should not force MCP routing.
+    if (/\[\s*request interrupted\b/i.test(text)) continue;
     for (const item of msg.content) {
       if (item && item.type === "tool_result" && typeof item.tool_use_id === "string" && item.tool_use_id) {
         toolUseIds.add(item.tool_use_id);
@@ -164,12 +167,91 @@ async function readStreamToString(stream) {
   return out;
 }
 
+async function logStreamContent(logger, stream, label) {
+  if (!logger || typeof logger.log !== "function") return;
+  if (!stream) return;
+  try {
+    const text = await readStreamToString(stream);
+    if (text) logger.log("debug", String(label), text);
+  } catch (err) {
+    const msg = err?.message || err;
+    logger.log("warn", `Raw stream log failed for ${label}: ${msg}`);
+  }
+}
+
+async function readStreamToStringAndChunks(stream) {
+  if (!stream || typeof stream.getReader !== "function") return { text: "", chunks: [], delaysMs: [] };
+
+  const reader = stream.getReader();
+  const decoder = new TextDecoder();
+
+  let text = "";
+  const chunks = [];
+  const delaysMs = [];
+  let lastChunkAt = null;
+
+  while (true) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    if (!value) continue;
+    const now = Date.now();
+    delaysMs.push(lastChunkAt == null ? 0 : Math.max(0, now - lastChunkAt));
+    lastChunkAt = now;
+    const src = value instanceof Uint8Array ? value : new Uint8Array(value);
+    const copy = new Uint8Array(src.byteLength);
+    copy.set(src);
+    chunks.push(copy);
+    text += decoder.decode(copy, { stream: true });
+  }
+
+  text += decoder.decode();
+  return { text, chunks, delaysMs };
+}
+
 function streamFromString(text) {
   const encoder = new TextEncoder();
   return new ReadableStream({
     start(controller) {
       controller.enqueue(encoder.encode(text || ""));
       controller.close();
+    },
+  });
+}
+
+function streamFromChunks(chunks) {
+  const list = Array.isArray(chunks) ? chunks : [];
+  let index = 0;
+  return new ReadableStream({
+    pull(controller) {
+      if (index >= list.length) {
+        controller.close();
+        return;
+      }
+      controller.enqueue(list[index++]);
+      if (index >= list.length) controller.close();
+    },
+  });
+}
+
+function streamFromTimedChunks(chunks, delaysMs) {
+  const list = Array.isArray(chunks) ? chunks : [];
+  const delays = Array.isArray(delaysMs) ? delaysMs : [];
+  const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
+  let canceled = false;
+  return new ReadableStream({
+    async start(controller) {
+      for (let i = 0; i < list.length && !canceled; i++) {
+        const delay = Number.isFinite(delays[i]) ? delays[i] : 0;
+        const waitMs = Math.max(0, Math.round(delay * 0.5));
+        if (waitMs > 0) await sleep(waitMs);
+        if (canceled) break;
+        controller.enqueue(list[i]);
+      }
+      if (!canceled) controller.close();
+    },
+    cancel() {
+      canceled = true;
     },
   });
 }
@@ -311,23 +393,25 @@ async function bufferForMcpSwitchAndMaybeRetry({
   convertedResponse,
   shouldBufferForSwitch,
   debugRequestResponse,
-  log,
-  logDebug,
-  logStreamContent,
+  logger,
   sessionState,
 }) {
   if (!shouldBufferForSwitch || !convertedResponse?.body) return null;
 
-  const buffered = await readStreamToString(convertedResponse.body);
+  if (!logger || typeof logger.log !== "function") {
+    throw new Error("bufferForMcpSwitchAndMaybeRetry requires a logger with .log(level, message, meta)");
+  }
+
+  const { text: buffered, chunks, delaysMs } = await readStreamToStringAndChunks(convertedResponse.body);
   if (debugRequestResponse && buffered) {
-    log("Claude Response Payload (Transformed Stream)", buffered);
+    logger.log("debug", "Claude Response Payload (Transformed Stream)", buffered);
   }
 
   if (!hasMcpSwitchSignal(buffered)) {
-    return { finalResponseBody: streamFromString(buffered) };
+    return { finalResponseBody: streamFromTimedChunks(chunks, delaysMs) };
   }
 
-  log("info", `MCP switch signal detected; retrying upstream with ${mcpModel}`);
+  logger.log("info", `MCP switch signal detected; retrying upstream with ${mcpModel}`);
 
   let retryLoggedTransformed = false;
   const retryResp = await upstream.callV1Internal(method, {
@@ -339,7 +423,9 @@ async function bufferForMcpSwitchAndMaybeRetry({
         signatureSegmentStartIndex,
       });
       if (!retryLoggedTransformed) {
-        logDebug("Gemini Payload Request (Transformed, Retry MCP)", googleBody);
+        if (debugRequestResponse) {
+          logger.log("debug", "Gemini Payload Request (Transformed, Retry MCP)", googleBody);
+        }
         retryLoggedTransformed = true;
       }
       return googleBody;
@@ -354,14 +440,14 @@ async function bufferForMcpSwitchAndMaybeRetry({
       try {
         if (typeof retryResp.body.tee === "function") {
           const [logBranch, processBranch] = retryResp.body.tee();
-          logStreamContent(logBranch, `Upstream Error Raw (Stream, Retry MCP, HTTP ${retryResp.status})`);
+          logStreamContent(logger, logBranch, `Upstream Error Raw (Stream, Retry MCP, HTTP ${retryResp.status})`);
           body = processBranch;
         } else {
           const errorText = await retryResp.clone().text().catch(() => "");
-          if (errorText) log(`Upstream Error Body (Retry MCP, HTTP ${retryResp.status})`, errorText);
+          if (errorText) logger.log("debug", `Upstream Error Body (Retry MCP, HTTP ${retryResp.status})`, errorText);
         }
       } catch (e) {
-        log("warn", `Failed to log retry upstream error body: ${e.message || e}`);
+        logger.log("warn", `Failed to log retry upstream error body: ${e.message || e}`);
       }
     }
 
@@ -373,14 +459,14 @@ async function bufferForMcpSwitchAndMaybeRetry({
   if (debugRequestResponse && retryResp.body) {
     try {
       const [logBranch, processBranch] = retryResp.body.tee();
-      logStreamContent(logBranch, "Gemini Response Raw (Stream, Retry MCP)");
+      logStreamContent(logger, logBranch, "Gemini Response Raw (Stream, Retry MCP)");
       retryForTransform = new Response(processBranch, {
         status: retryResp.status,
         statusText: retryResp.statusText,
         headers: retryResp.headers,
       });
     } catch (e) {
-      log("Error teeing retry stream for logging", e.message || e);
+      logger.log("warn", "Error teeing retry stream for logging", e.message || e);
     }
   }
 
@@ -390,10 +476,10 @@ async function bufferForMcpSwitchAndMaybeRetry({
   if (debugRequestResponse && retryConverted.body) {
     try {
       const [logBranch, processBranch] = retryConverted.body.tee();
-      logStreamContent(logBranch, "Claude Response Payload (Transformed Stream, Retry MCP)");
+      logStreamContent(logger, logBranch, "Claude Response Payload (Transformed Stream, Retry MCP)");
       retryBody = processBranch;
     } catch (e) {
-      log("Error teeing retry converted stream for logging", e.message || e);
+      logger.log("warn", "Error teeing retry converted stream for logging", e.message || e);
     }
   }
 

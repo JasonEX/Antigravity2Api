@@ -1,6 +1,3 @@
-const path = require("path");
-const httpClient = require("../auth/httpClient");
-
 function getAccountsPayload(authManager) {
   const accounts = authManager.getAccountsSummary();
   return {
@@ -30,56 +27,61 @@ async function reloadAccounts(authManager) {
   };
 }
 
+function formatLocalDateTime(date) {
+  if (!(date instanceof Date) || !Number.isFinite(date.getTime())) return "-";
+  const yyyy = date.getFullYear();
+  const MM = String(date.getMonth() + 1).padStart(2, "0");
+  const dd = String(date.getDate()).padStart(2, "0");
+  const HH = String(date.getHours()).padStart(2, "0");
+  const mm = String(date.getMinutes()).padStart(2, "0");
+  const ss = String(date.getSeconds()).padStart(2, "0");
+  return `${yyyy}-${MM}-${dd} ${HH}:${mm}:${ss}`;
+}
+
+function formatRemainingFractionAsPercent(remainingFraction) {
+  if (typeof remainingFraction !== "number" || !Number.isFinite(remainingFraction)) return "-";
+  const percent = remainingFraction * 100;
+  const text = percent.toFixed(2).replace(/\.?0+$/, "");
+  return `${text}%`;
+}
+
 async function getAccountQuota(authManager, fileName, upstreamClient) {
   const safeName = String(fileName || "").trim();
-  const account = authManager.accounts.find((acc) => path.basename(acc.filePath) === safeName);
-  
+  const account = authManager.accounts.find((acc) => acc.keyName === safeName);
+
   if (!account) {
     throw new Error("Account not found");
   }
 
   const accountIndex = authManager.accounts.indexOf(account);
-  const originalClaudeIdx = authManager.getCurrentAccountIndex("claude");
-  const originalGeminiIdx = authManager.getCurrentAccountIndex("gemini");
+  const models = await upstreamClient.fetchAvailableModelsByAccountIndex(accountIndex);
 
-  let models;
-  try {
-    authManager.setCurrentAccountIndex("claude", accountIndex);
-    authManager.setCurrentAccountIndex("gemini", accountIndex);
-    models = await upstreamClient.fetchAvailableModels();
-  } finally {
-    authManager.setCurrentAccountIndex("claude", originalClaudeIdx);
-    authManager.setCurrentAccountIndex("gemini", originalGeminiIdx);
-  }
-  
   const result = [];
   if (models && typeof models === "object") {
     for (const modelId in models) {
-      if (modelId.includes("gemini") || modelId.includes("claude")) {
-        const m = models[modelId];
-        const quota = m.quotaInfo || {};
-        const limit = quota.remainingFraction !== undefined 
-          ? `${Math.round(quota.remainingFraction * 100)}%` 
-          : "-";
-        
-        let reset = "-";
-        if (quota.resetTime) {
-            try {
-                reset = new Date(quota.resetTime).toLocaleString();
-            } catch(e) {}
+      const m = models[modelId];
+      const quota = m.quotaInfo || {};
+      const limit = formatRemainingFractionAsPercent(quota.remainingFraction);
+      let resetTimeMs = null;
+      let reset = "-";
+      if (quota.resetTime) {
+        const d = new Date(quota.resetTime);
+        if (Number.isFinite(d.getTime())) {
+          resetTimeMs = d.getTime();
+          reset = formatLocalDateTime(d);
         }
-
-        result.push({
-          model: modelId,
-          limit,
-          reset,
-        });
       }
+
+      result.push({
+        model: modelId,
+        limit,
+        reset,
+        resetTimeMs,
+      });
     }
   }
-  
-  result.sort((a, b) => a.model.localeCompare(b.model));
 
+  result.sort((a, b) => a.model.localeCompare(b.model));
   return result;
 }
 

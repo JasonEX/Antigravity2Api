@@ -1,72 +1,25 @@
-const path = require("path");
-const fs = require("fs/promises");
-
 const RateLimiter = require("./RateLimiter");
+const storage = require("./Storage");
 const TokenRefresher = require("./TokenRefresher");
 const httpClient = require("./httpClient");
-
-function generateProjectId() {
-  // 生成类似 "fabled-setup-3dmkj" 的格式：word-word-5位随机
-  const adjectives = [
-    "fabled",
-    "spry",
-    "apt",
-    "astral",
-    "infra",
-    "brisk",
-    "calm",
-    "daring",
-    "eager",
-    "gentle",
-    "lively",
-    "noble",
-    "quick",
-    "rural",
-    "solar",
-    "tidy",
-    "vivid",
-    "witty",
-    "young",
-    "zesty",
-  ];
-  const nouns = [
-    "setup",
-    "post",
-    "site",
-    "scout",
-    "battery",
-    "arbor",
-    "beacon",
-    "canyon",
-    "delta",
-    "ember",
-    "grove",
-    "harbor",
-    "meadow",
-    "nexus",
-    "prairie",
-    "ridge",
-    "savanna",
-    "tundra",
-    "valley",
-    "willow",
-  ];
-  const adj = adjectives[Math.floor(Math.random() * adjectives.length)];
-  const noun = nouns[Math.floor(Math.random() * nouns.length)];
-  // 生成 5 位 base36 随机串
-  let suffix = "";
-  while (suffix.length < 5) {
-    suffix += require("crypto").randomBytes(4).readUInt32BE().toString(36);
-  }
-  suffix = suffix.slice(0, 5);
-  return `${adj}-${noun}-${suffix}`;
-}
 
 function normalizeQuotaGroup(group) {
   const g = String(group || "").trim().toLowerCase();
   if (g === "claude") return "claude";
   if (g === "gemini") return "gemini";
   return "gemini";
+}
+
+function isValidProjectId(projectId) {
+  const value = typeof projectId === "string" ? projectId.trim() : "";
+  return value.length > 0;
+}
+
+function hasProjectIdRepairMarker(creds) {
+  const value = creds?.projectIdResolvedAt;
+  if (typeof value === "number" && Number.isFinite(value)) return true;
+  if (typeof value === "string" && value.trim()) return true;
+  return false;
 }
 
 function sanitizeCredentialFileName(fileName) {
@@ -83,19 +36,22 @@ function sanitizeCredentialFileName(fileName) {
 
 class AuthManager {
   constructor(options = {}) {
-    this.authDir = options.authDir || path.resolve(process.cwd(), "auths");
     this.accounts = [];
-    // Claude/Gemini quotas are independent; keep rotation state per group.
     this.currentAccountIndexByGroup = { claude: 0, gemini: 0 };
-    this.logger = options.logger || null;
-    // Ensure v1internal requests are spaced >= 500ms.
-    this.apiLimiter = options.rateLimiter || new RateLimiter(500);
-    this.lastLoadCodeAssistBody = null;
+    this.logger = options.logger;
+    this.apiLimiter = options.rateLimiter || new RateLimiter(1 * 1000);
+
+    if (!this.logger || typeof this.logger.log !== "function") {
+      throw new Error("AuthManager requires options.logger with .log(level, message, meta)");
+    }
 
     this.tokenRefresher = new TokenRefresher({
       logger: this.logger,
       refreshFn: this.refreshToken.bind(this),
     });
+
+    this.initialTokenRefreshPromise = null;
+    this.initialProjectIdRefreshPromise = null;
   }
 
   setLogger(logger) {
@@ -103,31 +59,6 @@ class AuthManager {
     if (this.tokenRefresher) {
       this.tokenRefresher.logger = logger;
     }
-  }
-
-  log(title, data) {
-    if (this.logger) {
-      // 支持新的日志 API
-      if (typeof this.logger.log === "function") {
-        return this.logger.log(title, data);
-      }
-      // 兼容旧的日志函数
-      if (typeof this.logger === "function") {
-        return this.logger(title, data);
-      }
-    }
-    if (data !== undefined && data !== null) {
-      console.log(`[${title}]`, typeof data === "string" ? data : JSON.stringify(data, null, 2));
-    } else {
-      console.log(`[${title}]`);
-    }
-  }
-
-  logAccount(action, options = {}) {
-    if (this.logger && typeof this.logger.logAccount === "function") {
-      return this.logger.logAccount(action, options);
-    }
-    this.log("account", { action, ...options });
   }
 
   async waitForApiSlot() {
@@ -143,7 +74,7 @@ class AuthManager {
   getAccountsSummary() {
     return this.accounts.map((account, index) => ({
       index,
-      file: path.basename(account.filePath),
+      file: account.keyName,
       email: account.creds?.email || null,
       projectId: account.creds?.projectId || null,
       expiry_date: Number.isFinite(account.creds?.expiry_date) ? account.creds.expiry_date : null,
@@ -169,23 +100,9 @@ class AuthManager {
     this.currentAccountIndexByGroup[g] = index;
   }
 
-  rotateAccount(group) {
-    const g = normalizeQuotaGroup(group);
-    if (this.accounts.length <= 1) return false;
-    const nextIndex = (this.getCurrentAccountIndex(g) + 1) % this.accounts.length;
-    this.setCurrentAccountIndex(g, nextIndex);
-    const accountName = path.basename(this.accounts[nextIndex].filePath);
-    this.logAccount(`轮换账户`, {
-      group: g,
-      account: accountName,
-      reason: `切换到第 ${nextIndex + 1}/${this.accounts.length} 个账户`,
-    });
-    return true;
-  }
-
   async deleteAccountByFile(fileName) {
     const safeName = sanitizeCredentialFileName(fileName);
-    const idx = this.accounts.findIndex((a) => path.basename(a.filePath) === safeName);
+    const idx = this.accounts.findIndex((a) => a.keyName === safeName);
     if (idx === -1) {
       return false;
     }
@@ -199,7 +116,7 @@ class AuthManager {
       account.refreshTimer = null;
     }
 
-    await fs.unlink(account.filePath).catch(() => {});
+    await storage.delete(account.keyName);
     this.accounts.splice(idx, 1);
 
     for (const group of ["claude", "gemini"]) {
@@ -222,50 +139,129 @@ class AuthManager {
     this.accounts = [];
     this.currentAccountIndexByGroup = { claude: 0, gemini: 0 };
     try {
-      // Ensure auth directory exists
-      try {
-        await fs.access(this.authDir);
-      } catch {
-        await fs.mkdir(this.authDir, { recursive: true });
-      }
+      await storage.init();
 
-      const files = await fs.readdir(this.authDir);
-      const candidates = files.filter((f) => f.endsWith(".json") && !f.startsWith("package") && f !== "tsconfig.json");
+      const entries = await storage.list();
+      const candidates = entries.filter(
+        (e) => e.key.endsWith(".json") && !e.key.startsWith("package") && e.key !== "tsconfig.json"
+      );
 
       let loadedCount = 0;
-      for (const file of candidates) {
+      for (const entry of candidates) {
         try {
-          const filePath = path.join(this.authDir, file);
-          const content = await fs.readFile(filePath, "utf8");
-          try {
-            const creds = JSON.parse(content);
-            if (creds.access_token && creds.refresh_token && (creds.token_type || creds.scope)) {
-              this.accounts.push({
-                filePath,
-                creds,
-                refreshPromise: null,
-                refreshTimer: null,
-                projectPromise: null,
-              });
-              loadedCount++;
-            }
-          } catch (parseErr) {}
+          const creds = entry.data;
+          if (creds.access_token && creds.refresh_token && (creds.token_type || creds.scope)) {
+            this.accounts.push({
+              keyName: entry.key,
+              creds,
+              refreshPromise: null,
+              refreshTimer: null,
+              projectPromise: null,
+            });
+            loadedCount++;
+          }
         } catch (e) {}
       }
 
       if (loadedCount === 0) {
-        this.log("warn", "⚠️ 未找到任何账户");
+        this.logger.log("warn", "⚠️ 未找到任何账户");
         return;
       }
 
-      this.log("success", `✅ 已加载 ${this.accounts.length} 个账户`);
+      this.logger.log("success", `✅ 已加载 ${this.accounts.length} 个账户`);
 
       for (const account of this.accounts) {
         this.tokenRefresher.scheduleRefresh(account);
       }
+
+      this.initialTokenRefreshPromise = this.tokenRefresher
+        ? this.tokenRefresher.refreshDueAccountsNow().catch(() => {})
+        : Promise.resolve();
+
+      this.initialProjectIdRefreshPromise = (async () => {
+        try {
+          await this.waitInitialTokenRefresh();
+        } catch (_) {}
+        await this.refreshAllProjectIds();
+      })().catch(() => {});
     } catch (err) {
-      this.log("error", `Error loading accounts: ${err.message || err}`);
+      this.logger.log("error", `Error loading accounts: ${err.message || err}`);
     }
+  }
+
+  async waitInitialTokenRefresh() {
+    if (this.initialTokenRefreshPromise) {
+      await this.initialTokenRefreshPromise;
+    }
+  }
+
+  async waitInitialProjectIdRefresh() {
+    if (this.initialProjectIdRefreshPromise) {
+      await this.initialProjectIdRefreshPromise;
+    }
+  }
+
+  async refreshAllProjectIds() {
+    const count = this.getAccountCount();
+    if (!count) return { ok: 0, fail: 0, total: 0 };
+
+    const perAccount = [];
+    for (let i = 0; i < count; i++) {
+      perAccount.push(
+        (async () => {
+          const account = this.accounts[i];
+          const accountName = account?.keyName || `account_${i}`;
+          try {
+            if (account?.creds && isValidProjectId(account.creds.projectId) && hasProjectIdRepairMarker(account.creds)) {
+              return { ok: true, accountName, skipped: true };
+            }
+
+            const token = await this.getAccessTokenByIndex(i, "project-repair");
+            const accessToken = token?.accessToken;
+            if (!accessToken) {
+              throw new Error("Missing access_token");
+            }
+
+            const projectId = await httpClient.fetchProjectId(accessToken, null, { maxAttempts: 3 });
+            if (!isValidProjectId(projectId)) {
+              throw new Error(`Invalid projectId: ${String(projectId || "")}`.trim());
+            }
+
+            if (!account?.creds) {
+              throw new Error("Account not loaded");
+            }
+            const needsWrite =
+              account.creds.projectId !== projectId || !hasProjectIdRepairMarker(account.creds);
+            account.creds.projectId = projectId;
+            account.creds.projectIdResolvedAt = new Date().toISOString();
+            if (needsWrite) {
+              await storage.set(account.keyName, account.creds);
+            }
+
+            return { ok: true, accountName };
+          } catch (e) {
+            return { ok: false, accountName, error: e };
+          }
+        })()
+      );
+    }
+
+    const results = await Promise.all(perAccount);
+
+    let ok = 0;
+    let fail = 0;
+    for (const r of results) {
+      if (r?.ok) {
+        ok++;
+        continue;
+      }
+      fail++;
+      const msg = String(r?.error?.message || r?.error || "unknown error").split("\n")[0].slice(0, 200);
+      this.logger.log("warn", `⚠️ projectId 修复失败 @${r?.accountName || "unknown-account"}${msg ? ` (${msg})` : ""}`);
+    }
+
+    this.logger.log("info", `projectId 修复完成 ok=${ok} fail=${fail}`);
+    return { ok, fail, total: count };
   }
 
   async reloadAccounts() {
@@ -285,44 +281,27 @@ class AuthManager {
   }
 
   async fetchProjectId(accessToken) {
-    await this.waitForApiSlot();
-    const { projectId, rawBody } = await httpClient.fetchProjectId(accessToken, this.apiLimiter);
-    this.lastLoadCodeAssistBody = rawBody;
-    return projectId;
+    return httpClient.fetchProjectId(accessToken, this.apiLimiter, { maxAttempts: 3 });
   }
 
   async ensureProjectId(account) {
-    if (account.creds.projectId) {
-      return account.creds.projectId;
-    }
+    const existing = account?.creds?.projectId;
+    if (isValidProjectId(existing) && hasProjectIdRepairMarker(account?.creds)) return existing.trim();
 
     if (account.projectPromise) {
       return account.projectPromise;
     }
 
     account.projectPromise = (async () => {
-      let projectId = account.creds.projectId;
-
-      if (!projectId) {
-        projectId = await this.fetchProjectId(account.creds.access_token);
-      }
-
-      if (!projectId) {
-        const lastRaw = this.lastLoadCodeAssistBody;
-        const hasPaidTier = lastRaw && lastRaw.includes('"paidTier"');
-        if (hasPaidTier) {
-          projectId = generateProjectId();
-          this.log("warn", `loadCodeAssist 无 projectId，但检测到 paidTier，使用随机 projectId: ${projectId}`);
-        }
-      }
-
-      if (!projectId) {
-        throw new Error("Account is not eligible (projectId missing)");
+      const projectId = await this.fetchProjectId(account.creds.access_token);
+      if (!isValidProjectId(projectId)) {
+        throw new Error(`Failed to obtain valid projectId: ${String(projectId || "")}`.trim());
       }
 
       account.creds.projectId = projectId;
-      await fs.writeFile(account.filePath, JSON.stringify(account.creds, null, 2));
-      this.log("info", `✅ 获取 projectId 成功: ${projectId}`);
+      account.creds.projectIdResolvedAt = new Date().toISOString();
+      await storage.set(account.keyName, account.creds);
+      this.logger.log("info", `✅ 获取 projectId 成功: ${projectId}`);
       return projectId;
     })();
 
@@ -347,8 +326,8 @@ class AuthManager {
     }
 
     if (account.creds.expiry_date < +new Date()) {
-      const accountName = path.basename(account.filePath);
-      this.log("info", `Refreshing token for [${quotaGroup}] account ${accountIndex + 1} (${accountName})...`);
+      const accountName = account.keyName;
+      this.logger.log("info", `Refreshing token for [${quotaGroup}] account ${accountIndex + 1} (${accountName})...`);
       await this.refreshToken(account);
     }
 
@@ -361,15 +340,80 @@ class AuthManager {
     };
   }
 
+  async getCredentialsByIndex(index, group) {
+    if (this.accounts.length === 0) {
+      throw new Error("No accounts available. Please authenticate first.");
+    }
+
+    const quotaGroup = normalizeQuotaGroup(group);
+    const logGroup = group ? String(group).trim() : quotaGroup;
+    const accountIndex = Number.isInteger(index) ? index : Number.parseInt(String(index), 10);
+    if (!Number.isInteger(accountIndex) || accountIndex < 0 || accountIndex >= this.accounts.length) {
+      throw new Error(`Invalid account index: ${index}`);
+    }
+
+    const account = this.accounts[accountIndex];
+
+    if (account.refreshPromise) {
+      await account.refreshPromise;
+    }
+
+    if (account.creds.expiry_date < +new Date()) {
+      const accountName = account.keyName;
+      this.logger.log("info", `Refreshing token for [${logGroup}] account ${accountIndex + 1} (${accountName})...`);
+      await this.refreshToken(account);
+    }
+
+    await this.ensureProjectId(account);
+
+    return {
+      accessToken: account.creds.access_token,
+      projectId: account.creds.projectId,
+      account,
+      accountIndex,
+    };
+  }
+
+  async getAccessTokenByIndex(index, group) {
+    if (this.accounts.length === 0) {
+      throw new Error("No accounts available. Please authenticate first.");
+    }
+
+    const quotaGroup = normalizeQuotaGroup(group);
+    const logGroup = group ? String(group).trim() : quotaGroup;
+    const accountIndex = Number.isInteger(index) ? index : Number.parseInt(String(index), 10);
+    if (!Number.isInteger(accountIndex) || accountIndex < 0 || accountIndex >= this.accounts.length) {
+      throw new Error(`Invalid account index: ${index}`);
+    }
+
+    const account = this.accounts[accountIndex];
+
+    if (account.refreshPromise) {
+      await account.refreshPromise;
+    }
+
+    if (account.creds.expiry_date < +new Date()) {
+      const accountName = account.keyName;
+      this.logger.log("info", `Refreshing token for [${logGroup}] account ${accountIndex + 1} (${accountName})...`);
+      await this.refreshToken(account);
+    }
+
+    return {
+      accessToken: account.creds.access_token,
+      account,
+      accountIndex,
+    };
+  }
+
   async getCurrentAccessToken(group) {
     const { accessToken } = await this.getCredentials(group);
     return accessToken;
   }
 
   async fetchAvailableModels() {
-    const accessToken = await this.getCurrentAccessToken();
+    const { accessToken, projectId } = await this.getCredentials();
     await this.waitForApiSlot();
-    return httpClient.fetchAvailableModels(accessToken, this.apiLimiter);
+    return httpClient.fetchAvailableModels(accessToken, this.apiLimiter, projectId);
   }
 
   async fetchUserInfo(accessToken) {
@@ -382,32 +426,19 @@ class AuthManager {
     const previousGeminiIndex = this.getCurrentAccountIndex("gemini");
     const hadAccountsBefore = this.accounts.length > 0;
 
-    // Ensure auth directory exists
-    try {
-      await fs.access(this.authDir);
-    } catch {
-      await fs.mkdir(this.authDir, { recursive: true });
-    }
+    await storage.init();
 
-    // Fetch projectId：先尝试 API 获取；如果没有，且检测到 paidTier 则随机生成
-    let projectId = await this.fetchProjectId(formattedData.access_token);
-    if (!projectId) {
-      const hasPaidTier = this.lastLoadCodeAssistBody && this.lastLoadCodeAssistBody.includes('"paidTier"');
-      if (hasPaidTier) {
-        projectId = generateProjectId();
-        this.log("warn", `loadCodeAssist 无 projectId，但检测到 paidTier，使用随机 projectId: ${projectId}`);
-      }
-    }
-    if (!projectId) {
-      throw new Error("Failed to obtain projectId, account is not eligible");
+    const projectId = await this.fetchProjectId(formattedData.access_token);
+    if (!isValidProjectId(projectId)) {
+      throw new Error(`Failed to obtain valid projectId, account is not eligible: ${String(projectId || "")}`.trim());
     }
     formattedData.projectId = projectId;
-    this.log("info", `✅ 项目ID获取成功: ${projectId}`);
+    formattedData.projectIdResolvedAt = new Date().toISOString();
+    this.logger.log("info", `✅ 项目ID获取成功: ${projectId}`);
 
     const email = formattedData.email;
 
-    // Check for duplicates
-    let targetFilePath = null;
+    let targetKeyName = null;
     let existingAccountIndex = -1;
 
     if (email) {
@@ -426,44 +457,47 @@ class AuthManager {
         }
 
         if (accEmail && accEmail === email) {
-          targetFilePath = acc.filePath;
+          targetKeyName = acc.keyName;
           existingAccountIndex = i;
-          this.log("info", `Found existing account for ${email}, updating...`);
+          this.logger.log("info", `Found existing account for ${email}, updating...`);
           break;
         }
       }
     }
 
-    // Determine filename
+    let oldKeyNameToDelete = null;
     if (existingAccountIndex !== -1) {
-      targetFilePath = this.accounts[existingAccountIndex].filePath;
+      targetKeyName = this.accounts[existingAccountIndex].keyName;
 
-      // Migrate to email-based filename if possible
       if (email) {
         const safeEmail = email.replace(/[^a-zA-Z0-9@.]/g, "_");
-        const newPath = path.join(this.authDir, `${safeEmail}.json`);
+        const newKeyName = `${safeEmail}.json`;
 
-        if (targetFilePath !== newPath) {
-          try {
-            await fs.unlink(targetFilePath).catch(() => {});
-            targetFilePath = newPath;
-            this.accounts[existingAccountIndex].filePath = newPath;
-            this.log("info", `Renamed credentials to ${path.basename(newPath)}`);
-          } catch (e) {
-            this.log("error", `Error renaming file: ${e.message || e}`);
-          }
+        if (targetKeyName !== newKeyName) {
+          oldKeyNameToDelete = targetKeyName;
+          targetKeyName = newKeyName;
+          this.accounts[existingAccountIndex].keyName = newKeyName;
+          this.logger.log("info", `Renamed credentials to ${newKeyName}`);
         }
       }
     } else {
       if (email) {
         const safeEmail = email.replace(/[^a-zA-Z0-9@.]/g, "_");
-        targetFilePath = path.join(this.authDir, `${safeEmail}.json`);
+        targetKeyName = `${safeEmail}.json`;
       } else {
-        targetFilePath = path.join(this.authDir, `oauth-${Date.now()}.json`);
+        targetKeyName = `oauth-${Date.now()}.json`;
       }
     }
 
-    await fs.writeFile(targetFilePath, JSON.stringify(formattedData, null, 2));
+    await storage.set(targetKeyName, formattedData);
+
+    if (oldKeyNameToDelete) {
+      try {
+        await storage.delete(oldKeyNameToDelete);
+      } catch (e) {
+        this.logger.log("warn", `Failed to delete old key "${oldKeyNameToDelete}": ${e.message || e}`);
+      }
+    }
 
     let targetAccount;
     if (existingAccountIndex !== -1) {
@@ -471,7 +505,7 @@ class AuthManager {
       targetAccount = this.accounts[existingAccountIndex];
     } else {
       targetAccount = {
-        filePath: targetFilePath,
+        keyName: targetKeyName,
         creds: formattedData,
         refreshPromise: null,
         refreshTimer: null,
@@ -480,8 +514,6 @@ class AuthManager {
       this.accounts.push(targetAccount);
     }
 
-    // Adding/updating an account should not implicitly change current selection.
-    // (If this is the first account, default to index 0.)
     const clampIndex = (idx) => {
       if (this.accounts.length === 0) return 0;
       const n = Number.isInteger(idx) ? idx : 0;
@@ -498,9 +530,9 @@ class AuthManager {
 
     this.tokenRefresher.scheduleRefresh(targetAccount);
 
-    this.log("info", "✅ OAuth authentication successful! Credentials saved.");
-    this.log("info", "ℹ️  To add more accounts, run: npm run add (or: node src/server.js --add)");
-    this.log("info", "🚀 You can now use the API.");
+    this.logger.log("info", "✅ OAuth authentication successful! Credentials saved.");
+    this.logger.log("info", "ℹ️  To add more accounts, run: npm run add (or: node src/server.js --add)");
+    this.logger.log("info", "🚀 You can now use the API.");
   }
 
   async refreshToken(account) {
@@ -511,40 +543,29 @@ class AuthManager {
     account.refreshPromise = (async () => {
       try {
         const refresh_token = account.creds.refresh_token;
-        await this.waitForApiSlot();
-        const data = await httpClient.refreshToken(refresh_token, this.apiLimiter);
+        const data = await httpClient.refreshToken(refresh_token, null);
 
-        // 保持 email 字段 (如果有)
         if (account.creds.email) {
           data.email = account.creds.email;
         }
 
-        // 补全 projectId（刷新可能首次需要）
-        if (account.creds.projectId) {
-          data.projectId = account.creds.projectId;
+        const existingProjectId = account.creds.projectId;
+        if (isValidProjectId(existingProjectId) && hasProjectIdRepairMarker(account.creds)) {
+          data.projectId = existingProjectId.trim();
+          data.projectIdResolvedAt = account.creds.projectIdResolvedAt;
         } else {
           const projectId = await this.fetchProjectId(data.access_token);
-          if (!projectId) {
-            const hasPaidTier =
-              this.lastLoadCodeAssistBody && this.lastLoadCodeAssistBody.includes('"paidTier"');
-            if (hasPaidTier) {
-              data.projectId = generateProjectId();
-              this.log(
-                "warn",
-                `⚠️ 刷新时 loadCodeAssist 无 projectId，但检测到 paidTier，使用随机 projectId: ${data.projectId}`
-              );
-            } else {
-              throw new Error("Failed to obtain projectId during refresh");
-            }
-          } else {
-            data.projectId = projectId;
-            this.log("info", `✅ 刷新时获取 projectId 成功: ${projectId}`);
+          if (!isValidProjectId(projectId)) {
+            throw new Error(`Failed to obtain valid projectId during refresh: ${String(projectId || "")}`.trim());
           }
+          data.projectId = projectId;
+          data.projectIdResolvedAt = new Date().toISOString();
+          this.logger.log("info", `✅ 刷新时获取 projectId 成功: ${projectId}`);
         }
 
         account.creds = data;
-        await fs.writeFile(account.filePath, JSON.stringify(data, null, 2));
-        this.log("info", `✅ Token refreshed for ${path.basename(account.filePath)}`);
+        await storage.set(account.keyName, data);
+        this.logger.log("info", `✅ Token refreshed for ${account.keyName}`);
 
         this.tokenRefresher.scheduleRefresh(account);
 

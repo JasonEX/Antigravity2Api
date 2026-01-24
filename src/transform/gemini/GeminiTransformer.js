@@ -1,4 +1,32 @@
 const crypto = require("crypto");
+const fs = require("fs");
+const path = require("path");
+const { mapGeminiModelFromEnv } = require("../modelMap");
+
+function normalizeAntigravitySystemInstructionText(text) {
+  if (typeof text !== "string") return "";
+  // Allow the file to be pasted from JSON logs (single line with literal "\n"/"\t" escapes).
+  if (!text.includes("\n") && text.includes("\\n")) {
+    return text
+      .replace(/\\r\\n/g, "\n")
+      .replace(/\\n/g, "\n")
+      .replace(/\\t/g, "\t")
+      .replace(/\\r/g, "\r")
+      .replace(/\\\\/g, "\\");
+  }
+  return text;
+}
+
+let antigravitySystemInstructionText = "";
+try {
+  antigravitySystemInstructionText = fs.readFileSync(
+    path.resolve(__dirname, "../claude/antigravity_system_instruction.txt"),
+    "utf8"
+  );
+  antigravitySystemInstructionText = normalizeAntigravitySystemInstructionText(
+    antigravitySystemInstructionText
+  );
+} catch (_) {}
 
 // Convert parametersJsonSchema -> parameters (clean + uppercase type names) for v1internal
 function cleanSchema(schema) {
@@ -18,11 +46,12 @@ function cleanSchema(schema) {
   const removeKeys = new Set([
     "$schema",
     "additionalProperties",
-    "format",
     "default",
     "uniqueItems",
     // v1internal Schema doesn't support JSON Schema draft keywords like `propertyNames`.
     "propertyNames",
+    "patternProperties",
+    "unevaluatedProperties"
   ]);
   let constValue;
   const validations = [];
@@ -39,6 +68,17 @@ function cleanSchema(schema) {
       continue;
     }
     if (removeKeys.has(k)) continue;
+
+    // `properties` is a map of propertyName -> schema. Preserve property names (e.g. a parameter named "format")
+    // and only clean each property's schema value.
+    if (k === "properties" && v && typeof v === "object" && !Array.isArray(v)) {
+      const cleanedProperties = {};
+      for (const [propName, propSchema] of Object.entries(v)) {
+        cleanedProperties[propName] = typeof propSchema === "object" && propSchema !== null ? cleanSchema(propSchema) : propSchema;
+      }
+      result.properties = cleanedProperties;
+      continue;
+    }
 
     if (k === "type" && Array.isArray(v)) {
       const filtered = v.filter((x) => x !== "null");
@@ -136,19 +176,35 @@ function wrapRequest(clientJson, options) {
   }
 
   // Map preview model name based on thinking level (high/low)
-  let mappedModelName = modelName;
+  let mappedModelName = mapGeminiModelFromEnv(modelName) || modelName;
   const levelForMapping = innerRequest?.generationConfig?.thinkingConfig?.thinkingLevel;
-  if (modelName === "gemini-3-flash-preview") {
+  if (mappedModelName === "gemini-3-flash-preview") {
     mappedModelName = "gemini-3-flash";
   }
-  if (modelName === "gemini-3-pro-preview" && typeof levelForMapping === "string") {
+  if (mappedModelName === "gemini-3-pro-preview" && typeof levelForMapping === "string") {
     const lvl = levelForMapping.toLowerCase();
     if (lvl === "high") mappedModelName = "gemini-3-pro-high";
     else if (lvl === "low") mappedModelName = "gemini-3-pro-low";
   }
 
+  const modelNameLower = String(mappedModelName || "").toLowerCase();
+  const isClaudeModel = modelNameLower.includes("claude");
+
+  // Ensure generationConfig is an object for downstream mutations.
+  if (!innerRequest.generationConfig || typeof innerRequest.generationConfig !== "object") {
+    innerRequest.generationConfig = {};
+  }
+
+  // Gemini CLI custom model may send generationConfig: {} for Claude models; enable thoughts by default.
+  if (isClaudeModel && Object.keys(innerRequest.generationConfig).length === 0) {
+    innerRequest.generationConfig.thinkingConfig = {
+      includeThoughts: true,
+      thinkingBudget: 31999,
+    };
+  }
+
   // Normalize thinkingLevel -> thinkingBudget for v1internal
-  const thinkingCfg = innerRequest?.generationConfig?.thinkingConfig;
+  const thinkingCfg = innerRequest.generationConfig.thinkingConfig;
   if (thinkingCfg && typeof thinkingCfg === "object" && thinkingCfg.thinkingLevel) {
     const lvl = String(thinkingCfg.thinkingLevel).toLowerCase();
     if (lvl === "high") {
@@ -166,12 +222,31 @@ function wrapRequest(clientJson, options) {
     }
   }
 
-  if (!innerRequest.generationConfig || typeof innerRequest.generationConfig !== "object" || Array.isArray(innerRequest.generationConfig)) {
-    innerRequest.generationConfig = {};
+  // Claude models: if the client explicitly enables thoughts but doesn't provide a budget, default to 31999.
+  if (
+    isClaudeModel &&
+    thinkingCfg &&
+    typeof thinkingCfg === "object" &&
+    thinkingCfg.includeThoughts === true &&
+    (!Number.isFinite(thinkingCfg.thinkingBudget) || thinkingCfg.thinkingBudget <= 0)
+  ) {
+    thinkingCfg.thinkingBudget = 31999;
   }
 
-  // Match current behavior: force maxOutputTokens
-  innerRequest.generationConfig.maxOutputTokens = 65535;
+  // Match current behavior: force maxOutputTokens.
+  // NOTE: Claude models reject 65535 (INVALID_ARGUMENT); use 64000 to align ClaudeRequestIn.
+  innerRequest.generationConfig.maxOutputTokens = isClaudeModel ? 64000 : 65535;
+
+  // Claude models require explicit safetySettings in practice; default to OFF thresholds.
+  if (isClaudeModel && (!Array.isArray(innerRequest.safetySettings) || innerRequest.safetySettings.length === 0)) {
+    innerRequest.safetySettings = [
+      { category: "HARM_CATEGORY_HARASSMENT", threshold: "OFF" },
+      { category: "HARM_CATEGORY_HATE_SPEECH", threshold: "OFF" },
+      { category: "HARM_CATEGORY_SEXUALLY_EXPLICIT", threshold: "OFF" },
+      { category: "HARM_CATEGORY_DANGEROUS_CONTENT", threshold: "OFF" },
+      { category: "HARM_CATEGORY_CIVIC_INTEGRITY", threshold: "OFF" },
+    ];
+  }
 
   // Derive requestType: image_gen for image model, web_search if googleSearch tool present, otherwise agent
   let requestType = "agent";
@@ -181,6 +256,20 @@ function wrapRequest(clientJson, options) {
     requestType = "web_search";
     // Force search requests to use 2.5 flash for built-in search behavior
     mappedModelName = "gemini-2.5-flash";
+  }
+
+  // Some upstream models (e.g. claude-*, gemini-3-pro*) require an Antigravity-style systemInstruction,
+  // otherwise they may respond with 429 RESOURCE_EXHAUSTED even when quota exists.
+  const modelNameForSystem = String(mappedModelName || "").toLowerCase();
+  if (
+    (modelNameForSystem.includes("claude") || modelNameForSystem.includes("gemini-3-pro")) &&
+    antigravitySystemInstructionText
+  ) {
+    // Directly replace the entire systemInstruction with antigravity content
+    innerRequest.systemInstruction = {
+      role: "user",
+      parts: [{ text: antigravitySystemInstructionText }],
+    };
   }
 
   const wrappedBody = {

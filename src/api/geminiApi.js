@@ -1,4 +1,149 @@
 const { wrapRequest, unwrapResponse, createUnwrapStream } = require("../transform/gemini");
+const { ensureLogger } = require("../utils/logger");
+
+function isGemini3ModelName(modelName) {
+  return String(modelName || "")
+    .toLowerCase()
+    .includes("gemini-3-pro");
+}
+
+function ensureAltSse(queryString) {
+  const raw = String(queryString || "");
+  const qs = raw.startsWith("?") ? raw.slice(1) : raw;
+  const params = new URLSearchParams(qs);
+  params.set("alt", "sse");
+  const next = params.toString();
+  return next ? `?${next}` : "?alt=sse";
+}
+
+function ensureMergedCandidate(target) {
+  if (!target || typeof target !== "object") return null;
+  if (!Array.isArray(target.candidates)) target.candidates = [];
+  if (!target.candidates[0] || typeof target.candidates[0] !== "object") {
+    target.candidates[0] = { content: { role: "model", parts: [] } };
+  }
+  if (!target.candidates[0].content || typeof target.candidates[0].content !== "object") {
+    target.candidates[0].content = { role: "model", parts: [] };
+  }
+  if (!Array.isArray(target.candidates[0].content.parts)) target.candidates[0].content.parts = [];
+  return target.candidates[0];
+}
+
+function mergeGeminiParts(targetParts, sourceParts) {
+  if (!Array.isArray(targetParts) || !Array.isArray(sourceParts) || sourceParts.length === 0) return;
+
+  const isMergeablePlainTextPart = (part) => {
+    if (!part || typeof part !== "object") return false;
+    if (typeof part.text !== "string") return false;
+    if (part.thought === true) return false;
+    const keys = Object.keys(part);
+    return keys.every((k) => k === "text" || k === "thought");
+  };
+
+  for (const part of sourceParts) {
+    if (!part || typeof part !== "object") continue;
+
+    if (part.thought === true && typeof part.text === "string") {
+      const last = targetParts[targetParts.length - 1];
+      if (last && typeof last === "object" && last.thought === true && typeof last.text === "string") {
+        last.text += part.text;
+        if (typeof part.thoughtSignature === "string" && part.thoughtSignature) {
+          last.thoughtSignature = part.thoughtSignature;
+        }
+        continue;
+      }
+    }
+
+    if (isMergeablePlainTextPart(part)) {
+      const last = targetParts[targetParts.length - 1];
+      if (isMergeablePlainTextPart(last)) {
+        last.text += part.text;
+        continue;
+      }
+    }
+
+    targetParts.push(part);
+  }
+}
+
+function mergeGeminiStreamChunk(target, chunk) {
+  if (!chunk || typeof chunk !== "object") return target;
+  const out = target && typeof target === "object" ? target : {};
+
+  for (const [key, value] of Object.entries(chunk)) {
+    if (key !== "candidates") {
+      out[key] = value;
+      continue;
+    }
+
+    if (!Array.isArray(value) || value.length === 0) continue;
+    const src = value[0];
+    if (!src || typeof src !== "object") continue;
+
+    const dst = ensureMergedCandidate(out);
+    if (!dst) continue;
+
+    for (const [ck, cv] of Object.entries(src)) {
+      if (ck === "content") {
+        if (!cv || typeof cv !== "object") continue;
+        if (cv.role) dst.content.role = cv.role;
+        if (Array.isArray(cv.parts) && cv.parts.length > 0) {
+          mergeGeminiParts(dst.content.parts, cv.parts);
+        }
+        continue;
+      }
+      dst[ck] = cv;
+    }
+  }
+
+  return out;
+}
+
+async function readGeminiSseToUnwrapped(body) {
+  const merged = { candidates: [{ content: { role: "model", parts: [] } }] };
+  if (!body || typeof body.getReader !== "function") return merged;
+
+  const reader = body.getReader();
+  const decoder = new TextDecoder();
+  let buffer = "";
+
+  while (true) {
+    const { done, value } = await reader.read();
+    if (done) break;
+
+    buffer += decoder.decode(value, { stream: true });
+    const lines = buffer.split("\n");
+    buffer = lines.pop() || "";
+
+    for (const line of lines) {
+      if (!line.startsWith("data:")) continue;
+      const dataStr = line.slice(5).trim();
+      if (!dataStr || dataStr === "[DONE]") continue;
+
+      try {
+        const parsed = JSON.parse(dataStr);
+        const unwrapped = unwrapResponse(parsed);
+        mergeGeminiStreamChunk(merged, unwrapped);
+      } catch (_) {
+        // ignore parse failures
+      }
+    }
+  }
+
+  const tail = buffer.trimEnd();
+  if (tail.startsWith("data:")) {
+    const dataStr = tail.slice(5).trim();
+    if (dataStr && dataStr !== "[DONE]") {
+      try {
+        const parsed = JSON.parse(dataStr);
+        const unwrapped = unwrapResponse(parsed);
+        mergeGeminiStreamChunk(merged, unwrapped);
+      } catch (_) {}
+    }
+  }
+
+  return merged;
+}
 
 function headersToObject(headers) {
   const out = {};
@@ -72,43 +217,17 @@ class GeminiApi {
   constructor(options = {}) {
     this.auth = options.authManager;
     this.upstream = options.upstreamClient;
-    this.logger = options.logger || null;
+    this.logger = ensureLogger(options.logger);
     this.debugRequestResponse = !!options.debug;
-  }
-
-  log(title, data, meta) {
-    if (this.logger) {
-      if (typeof this.logger.log === "function") {
-        return this.logger.log(title, data, meta);
-      }
-      if (typeof this.logger === "function") {
-        return this.logger(title, data, meta);
-      }
-    }
-
-    if (meta !== undefined) {
-      const outData = data !== undefined && data !== null ? (typeof data === "string" ? data : JSON.stringify(data, null, 2)) : "";
-      const outMeta = meta !== undefined && meta !== null ? (typeof meta === "string" ? meta : JSON.stringify(meta, null, 2)) : "";
-      if (outData || outMeta) return console.log(`[${title}]`, outData, outMeta);
-      return console.log(`[${title}]`);
-    }
-
-    if (data !== undefined && data !== null) {
-      return console.log(`[${title}]`, typeof data === "string" ? data : JSON.stringify(data, null, 2));
-    }
-    return console.log(`[${title}]`);
   }
 
   logDebug(title, data) {
     if (!this.debugRequestResponse) return;
-    this.log("debug", title, data);
+    this.logger.log("debug", title, data);
   }
 
   logStream(event, options = {}) {
-    if (this.logger && typeof this.logger.logStream === "function") {
-      return this.logger.logStream(event, options);
-    }
-    this.log("stream", { event, ...options });
+    return this.logger.logStream(event, options);
   }
 
   async logStreamContent(stream, label) {
@@ -124,10 +243,10 @@ class GeminiApi {
         bufferStr += chunkStr;
       }
       if (bufferStr) {
-        this.log(`${label}`, bufferStr);
+        this.logger.log("debug", String(label), bufferStr);
       }
     } catch (err) {
-      this.log("warn", `Raw stream log failed for ${label}: ${err.message || err}`);
+      this.logger.log("warn", `Raw stream log failed for ${label}: ${err.message || err}`);
     }
     return stream;
   }
@@ -149,7 +268,6 @@ class GeminiApi {
           (typeof entry === "object" && (entry.id || entry.name || entry.model)) ||
           (typeof entry === "string" ? entry : null);
         if (!rawId || typeof rawId !== "string") continue;
-        if (!rawId.toLowerCase().includes("gemini")) continue;
 
         const normalizedName = rawId.startsWith("models/") ? rawId : `models/${rawId}`;
         const supportedGenerationMethods =
@@ -215,6 +333,8 @@ class GeminiApi {
     try {
       this.logDebug("Gemini Request Raw", clientBody || "(empty body)");
 
+      const clientWantsStream = method === "streamGenerateContent";
+
       const clientBodyJson = JSON.stringify(clientBody || {});
       const parsedClientBody = JSON.parse(clientBodyJson);
 
@@ -246,10 +366,16 @@ class GeminiApi {
       const quotaProbe = wrapRequest(parsedClientBody, { projectId: "", modelName });
       const modelForQuota = quotaProbe.mappedModelName || modelName;
 
+      const mustUseStream = isGemini3ModelName(modelForQuota);
+      const upstreamMethod = mustUseStream ? "streamGenerateContent" : method;
+      const upstreamQueryString =
+        upstreamMethod === "streamGenerateContent" ? ensureAltSse(queryString || "") : queryString || "";
+      const shouldAggregateStream = !clientWantsStream && upstreamMethod === "streamGenerateContent";
+
       let loggedWrapped = false;
-      const upstreamResponse = await this.upstream.callV1Internal(method, {
+      const upstreamResponse = await this.upstream.callV1Internal(upstreamMethod, {
         model: modelForQuota,
-        queryString: queryString || "",
+        queryString: upstreamQueryString,
         buildBody: (projectId) => {
           const { wrappedBody } = wrapRequest(JSON.parse(clientBodyJson), { projectId, modelName });
           if (!loggedWrapped) {
@@ -271,7 +397,7 @@ class GeminiApi {
             headers: upstreamResponse.headers,
           });
         } catch (e) {
-          this.log("Error teeing Gemini native stream for logging", e.message || e);
+          this.logger.log("warn", "Error teeing Gemini native stream for logging", e.message || e);
         }
       }
 
@@ -284,6 +410,15 @@ class GeminiApi {
       }
 
       const contentType = responseForClient.headers.get("content-type") || "";
+
+      if (shouldAggregateStream && contentType.includes("stream") && responseForClient.body) {
+        const aggregated = await readGeminiSseToUnwrapped(responseForClient.body);
+        this.logDebug("Gemini Response Wrapped (Aggregated)", aggregated);
+
+        const respHeaders = headersToObject(responseForClient.headers);
+        respHeaders["Content-Type"] = "application/json";
+        return { status: responseForClient.status, headers: respHeaders, body: aggregated };
+      }
 
       // JSON response: unwrap payload and return JSON object
       if (contentType.includes("application/json")) {
@@ -318,7 +453,7 @@ class GeminiApi {
 
       return { status: responseForClient.status, headers: respHeaders, body: responseForClient.body };
     } catch (error) {
-      this.log("Error processing Gemini Request Raw", error.message || error);
+      this.logger.log("error", "Error processing Gemini Request Raw", error.message || error);
       return {
         status: 500,
         headers: { "Content-Type": "application/json" },

@@ -3,7 +3,7 @@
 本服务将 Antigravity 代理出来，转换为标准的 Claude API 和 Gemini API 接口，
 
 * 完整适配CC
-* WORK-AROUND for MCP
+* MCP XML bridge（mcp__* 工具）
 * function_calling
 * subagent
 * 结构化输出
@@ -25,29 +25,44 @@
 - **Thought Signatures（思考签名）**：按 Gemini 官方规范透传 `thoughtSignature`，在 thinking / 工具调用等场景中确保下一轮请求能原样带回签名，避免 `missing thought_signature` 类校验错误。
 - **工具调用（Tool Use）**：支持 Claude `tool_use` / `tool_result` 与 Gemini `functionCall` / `functionResponse` 的互转，兼容需要工具调用的客户端/工作流。
 
-已知问题：
-在使用MCP时，claude转为antigravity的v1internal接口所使用的gemini格式后，v1internal内部判断当前model是claude，会将request转回claude格式，但是其内部接口又不能使用claude的一些字段，所以MCP会有各种奇奇怪怪的问题，这也是使用原生Antigravity时会出现各种MCP问题的原因。只能看google后续会不会去修Antigravity的MCP，或者你也可以试用下如下WORK-AROUND FOR MCP方案
+**关于MCP**：
+在使用MCP时，claude转为antigravity的v1internal接口所使用的gemini格式后，v1internal内部判断当前model是claude，会将request转回claude格式，但是其内部接口又不能使用claude的一些字段，所以MCP会有各种奇奇怪怪的问题，这也是使用原生Antigravity时会出现各种MCP问题的原因。只能看google后续会不会去修Antigravity的MCP，**或者你也可以试用下如下WORK-AROUND FOR MCP方案**
 
-### WORK-AROUND FOR MCP 折中方案（实验性）
+### WORK-AROUND FOR MCP：XML 方案（推荐）已测试多个MCP使用正常！
 
-虽然 Antigravity 内部的 MCP 兼容性问题无法从外部彻底修复，但本项目提供一个“切换到 Gemini 执行 MCP”的折中方案，避免 Claude 模型直接触发 MCP 导致异常。
+> 仅覆盖 `mcp__*` 工具，用于绕过 Antigravity/v1internal 对 MCP tools 的兼容性问题。
+
+测试结果：
+
+![MCP XML 测试结果](screenshot-20260111-114221.png)
 
 **原理（简述）**
 
-- Claude 段：当检测到请求里存在 `mcp__*` 工具时，会在 system 中注入强提示：**严禁直接调用 MCP 工具**，需要通过输出特殊字符串 `AG2API_SWITCH_TO_MCP_MODEL` 通知服务端切换。
-- 服务端：如果在首轮流式输出中检测到 `AG2API_SWITCH_TO_MCP_MODEL`（或仍然出现 `mcp__*` 的 `tool_use`），会丢弃这次输出并用 `AG2API_SWITCH_TO_MCP_MODEL` 指定的 `gemini-*` 模型重发本轮请求，让 Gemini 来完成 MCP 工具调用。
-- 会话隔离：进入 Gemini（MCP）段后，后续相关 `tool_result` 回合继续路由到该 Gemini 模型；回到 Claude 段时会折叠 MCP 段历史，避免跨模型携带 thought/signature 导致 `Corrupted thought signature` 等报错。
+- 上行：当检测到请求里包含 `mcp__*` tools 且 `AG2API_MCP_XML_ENABLED=true` 时：
+  - 不将 `mcp__*` tools 透传给 v1internal（避免 schema/字段不兼容导致的 400/校验错误）
+  - 在 systemInstruction 注入 XML 协议说明，引导模型用 `<mcp__...>{...}</mcp__...>` 文本表示工具调用
+  - 历史里的 `mcp__* tool_use/tool_result` 也会编码为 XML 文本回传上游
+- 下行：代理从**非思考文本流**中解析上述 XML，并转换为标准 Claude `tool_use`；客户端返回 `tool_result` 后再编码为 `<mcp_tool_result>{...}</mcp_tool_result>` 发回上游。
+
+示例：
+
+```xml
+<mcp__serena__check_onboarding_performed>{}</mcp__serena__check_onboarding_performed>
+```
 
 **使用方法**
 
-1) 在 `.env` 配置 `AG2API_SWITCH_TO_MCP_MODEL`（为空/不配置则完全关闭该功能）：
+1) 在 `.env` 开启：
 
 ```bash
-# 推荐示例（仅示例，必须显式配置才会启用）
-AG2API_SWITCH_TO_MCP_MODEL=gemini-3-flash
+AG2API_MCP_XML_ENABLED=true
 ```
 
-2) 重启服务后，Claude Code/客户端正常使用 `mcp__*` 工具场景即可（触发时服务端会自动切换并重试）。
+2) 重启服务后，Claude Code/客户端正常使用 `mcp__*` 工具场景即可（代理会自动桥接 XML ↔ tool_use/tool_result）。
+
+### （已弃用）MCP Switch 方案：`AG2API_SWITCH_TO_MCP_MODEL`
+
+旧方案通过在首轮流式输出中检测特殊字符串 `AG2API_SWITCH_TO_MCP_MODEL`（或仍然出现 `mcp__* tool_use`）后，切换到指定 `gemini-*` 模型重发本轮请求以执行 MCP；保留兼容但不再推荐，后续可能移除。
 
 > **推荐启动方式**：在项目根目录运行 `npm run start`（或 `node src/server.js`）。本项目会以当前工作目录（`process.cwd()`）定位 `.env`、`auths/`、`log/`；如果你在 `src/` 目录运行，则对应路径会变成 `src/.env`、`src/auths/`、`src/log/`。
 
@@ -92,7 +107,13 @@ AG2API_PROXY_ENABLED=false
 AG2API_PROXY_URL=
 AG2API_DEBUG=false
 AG2API_LOG_RETENTION_DAYS=3
-AG2API_SWITCH_TO_MCP_MODEL=gemini-3-flash
+AG2API_RETRY_DELAY_MS=1200
+AG2API_QUOTA_REFRESH_S=300
+AG2API_CLAUDE_MODEL_MAP={"claude-haiku-4-5":"gemini-3-flash","claude-haiku-4-5-20251001":"gemini-3-flash"}
+AG2API_GEMINI_MODEL_MAP={"gemini-3-flash-preview":"gemini-3-flash"}
+AG2API_MCP_XML_ENABLED=true
+# Deprecated:
+# AG2API_SWITCH_TO_MCP_MODEL=gemini-3-flash
 AG2API_UPDATE_REPO=znlsl/Antigravity2Api
 
 # Optional: Thought Signatures / multi-instance
@@ -111,8 +132,13 @@ AG2API_THOUGHT_SIGNATURE_CACHE_MAX=50000
 - `AG2API_PROXY_ENABLED`：是否启用代理（true/false）
 - `AG2API_PROXY_URL`：代理地址
 - `AG2API_DEBUG`：是否开启 debug（true/false）
-- `AG2API_LOG_RETENTION_DAYS`：日志保留天数（默认 3；设为 0 表示不自动清理）
-- `AG2API_SWITCH_TO_MCP_MODEL`：MCP 折中方案开关；为空/不配置表示关闭，配置为 `gemini-*`（如 `gemini-3-flash`）表示在检测到 `AG2API_SWITCH_TO_MCP_MODEL` 信号或 `mcp__*` 工具调用时自动切换并重试
+- `AG2API_LOG_RETENTION_DAYS`：日志保留天数（默认 3；设为 0 表示不自动清理；当 >0 且服务长时间不重启时，会按该天数轮转日志文件，并在轮转后清理旧日志文件，避免单个日志无限增长）
+- `AG2API_RETRY_DELAY_MS`：网络错误 / 429 重试前的固定等待（毫秒，默认 1200）
+- `AG2API_QUOTA_REFRESH_S`：额度刷新间隔（秒；每次并发刷新所有账号；默认 300）
+- `AG2API_CLAUDE_MODEL_MAP`：Claude 模型映射（Claude API 入站 model -> 上游 model），仅支持 JSON 对象字符串（支持多个映射）
+- `AG2API_GEMINI_MODEL_MAP`：Gemini 模型映射（Gemini API 入站 model -> 上游 model），仅支持 JSON 对象字符串（支持多个映射）
+- `AG2API_MCP_XML_ENABLED`：MCP XML 方案开关（仅 `mcp__*`）；开启后不透传 `mcp__* tools` 给 v1internal，改为 XML 协议桥接并在下游还原为 `tool_use/tool_result`
+- `AG2API_SWITCH_TO_MCP_MODEL`：（已弃用）旧的 MCP Switch 方案；为空/不配置表示关闭，配置为 `gemini-*`（如 `gemini-3-flash`）表示在检测到 `AG2API_SWITCH_TO_MCP_MODEL` 信号或 `mcp__* tool_use` 时自动切换并重试
 - `AG2API_UPDATE_REPO`：管理界面版本检查的 GitHub 仓库（默认 `znlsl/Antigravity2Api`，用于获取 latest release）
 - `AG2API_THOUGHT_SIGNATURE_STORE_PATH`：可选；将 `tool_use.id -> thoughtSignature` 追加写入到 JSONL 文件（便于多实例/重启后补回签名）。**多实例时必须把该路径放到共享存储（例如同一个 volume）**。注意该文件可能包含敏感信息，需妥善保护。
 - `AG2API_THOUGHT_SIGNATURE_DUMMY`：可选；当当前 turn 的第一个 `tool_use` 缺失 thoughtSignature 且无法从缓存补回时，注入 dummy 值以绕过校验（值为 `true/1` 时默认使用 `skip_thought_signature_validator`；也可直接设置成具体字符串）。仅建议在多实例/会话漂移导致签名丢失时启用。
@@ -186,6 +212,12 @@ cp .env.example .env
 docker compose -f docker-compose.ghcr.yml up -d
 ```
 
+3) 更新版本：
+
+```bash
+docker compose -f docker-compose.ghcr.yml up -d --pull always
+```
+
 > 私有仓库/私有镜像需要先登录：`docker login ghcr.io`
 
 ### 6.2 本地构建（可选）
@@ -250,15 +282,37 @@ docker compose -f docker-compose.ghcr.yml up -d
 docker compose up -d --build
 ```
 
-## 7. 客户端连接 (如 CherryStudio)
+## 7. 客户端连接
 
-在客户端中添加自定义提供商（Claude）：
+在客户端中添加自定义提供商：
 
 *   **API 地址 (Endpoint)**: `http://localhost:3000` (或 `http://<本机IP>:3000`)
     *   Claude 兼容路径: `http://localhost:3000/v1/messages`
     *   Gemini 原生路径: `http://localhost:3000/v1beta`
 *   **API 密钥 (API Key)**: 填写你在 `AG2API_API_KEYS` 中配置的任意一个 Key。
     *   支持的传递方式：`Authorization: Bearer <key>` / `x-api-key` / `anthropic-api-key` / `x-goog-api-key`
+
+opencode配置：
+
+1. .env中配置
+
+    AG2API_CLAUDE_MODEL_MAP={"claude-haiku-4-5":"gemini-3-flash","claude-haiku-4-5-20251001":"gemini-3-flash"}
+
+2. opencode中connect选择Anthropic，手动输入API KEY
+
+3. C:\Users\你的用户名\.config\opencode\opencode.json
+```json
+{
+  "$schema": "https://opencode.ai/config.json",
+  "provider": {
+    "anthropic": {
+      "options": {
+        "baseURL": "http://localhost:3000/v1"
+      }
+    }
+  }
+}
+```
 
 ## 8. 常见问题
 
@@ -267,6 +321,42 @@ docker compose up -d --build
     *   确保已运行 `npm install` 安装依赖。
     *   检查 `AG2API_PROXY_URL` 是否正确且代理软件已开启。
     *   如果是 SOCKS5 代理，确保 `socks-proxy-agent` 已安装。
+
+*   **支持的模型**:
+    *   **Claude API** 支持如下模型（可在 Claude Code 中使用 Gemini 模型）:
+        *   `claude-sonnet-4-5`
+        *   `claude-sonnet-4-5-thinking`
+        *   `claude-sonnet-4-5-20250929`
+        *   `claude-opus-4-5`
+        *   `claude-opus-4-5-thinking`
+        *   `claude-opus-4-5-20251101`
+        *   `gemini-3-pro-high`
+        *   `gemini-3-pro-low`
+        *   `gemini-3-flash`
+        *   `gemini-2.5-flash`
+        *   `gemini-2.5-flash-lite`
+        *   `gpt-oss-120b-medium（仅限于chat）`
+        *   `.claude/settings.json` 参考配置（示例）:
+            ```json
+            {
+              "ANTHROPIC_MODEL": "claude-opus-4-5-thinking",
+              "ANTHROPIC_DEFAULT_HAIKU_MODEL": "gemini-3-flash",
+              "ANTHROPIC_DEFAULT_SONNET_MODEL": "claude-sonnet-4-5-thinking",
+              "ANTHROPIC_DEFAULT_OPUS_MODEL": "claude-opus-4-5-thinking",
+              "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC": "1",
+            }
+            ```
+    *   **Gemini API** 支持如下模型（可在 Gemini API 中使用 Claude 模型）:
+        *   `claude-sonnet-4-5`
+        *   `claude-sonnet-4-5-thinking`
+        *   `claude-opus-4-5-thinking`
+        *   `gemini-3-pro-high`
+        *   `gemini-3-pro-low`
+        *   `gemini-3-flash`
+        *   `gemini-3-pro-image`
+        *   `gemini-2.5-flash`
+        *   `gemini-2.5-flash-lite`
+        *   `gpt-oss-120b-medium（仅限于chat）`
 
 *   **OAuth 回调打不开**:
     *   授权完成后若跳到 `http://localhost:<port>/oauth-callback`，请把 `localhost:<port>` 改成当前服务地址再访问。

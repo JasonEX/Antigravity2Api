@@ -1,5 +1,6 @@
 const fs = require("fs");
 const path = require("path");
+const util = require("util");
 
 // ANSI 颜色代码
 const Colors = {
@@ -208,10 +209,80 @@ function createSeparator(char = "─", length = 60, color = Colors.gray) {
   return `${color}${char.repeat(length)}${Colors.reset}`;
 }
 
+const CONSOLE_CAPTURE_STATE_KEY = "__AG2API_CONSOLE_CAPTURE_STATE__";
+
+function attachConsoleCaptureToLogFile(logFile, rawConsole) {
+  if (!logFile) return;
+
+  const g = globalThis;
+  const state =
+    (g[CONSOLE_CAPTURE_STATE_KEY] && typeof g[CONSOLE_CAPTURE_STATE_KEY] === "object"
+      ? g[CONSOLE_CAPTURE_STATE_KEY]
+      : null) || { installed: false, logFile: null };
+
+  state.logFile = logFile;
+  g[CONSOLE_CAPTURE_STATE_KEY] = state;
+
+  if (state.installed) return;
+  state.installed = true;
+
+  const errOut = (rawConsole && typeof rawConsole.error === "function" ? rawConsole.error : rawConsole?.log) || (() => {});
+  const safeWrite = (level, args) => {
+    try {
+      const target = g[CONSOLE_CAPTURE_STATE_KEY]?.logFile;
+      if (!target) return;
+      const text = util.format(...(Array.isArray(args) ? args : [args]));
+      const line = `[${new Date().toISOString()}] [CONSOLE.${level}] ${text}\n`;
+      fs.appendFile(target, line, (err) => {
+        if (err) errOut("Failed to write captured console output:", err);
+      });
+    } catch (e) {
+      errOut("Failed to capture console output:", e);
+    }
+  };
+
+  const raw = {
+    log: (rawConsole && typeof rawConsole.log === "function" ? rawConsole.log : console.log).bind(console),
+    info: (rawConsole && typeof rawConsole.info === "function" ? rawConsole.info : console.info || console.log).bind(console),
+    warn: (rawConsole && typeof rawConsole.warn === "function" ? rawConsole.warn : console.warn || console.log).bind(console),
+    error: (rawConsole && typeof rawConsole.error === "function" ? rawConsole.error : console.error || console.log).bind(console),
+    debug: (rawConsole && typeof rawConsole.debug === "function" ? rawConsole.debug : console.debug || console.log).bind(console),
+  };
+
+  console.log = (...args) => {
+    raw.log(...args);
+    safeWrite("LOG", args);
+  };
+  console.info = (...args) => {
+    raw.info(...args);
+    safeWrite("INFO", args);
+  };
+  console.warn = (...args) => {
+    raw.warn(...args);
+    safeWrite("WARN", args);
+  };
+  console.error = (...args) => {
+    raw.error(...args);
+    safeWrite("ERROR", args);
+  };
+  console.debug = (...args) => {
+    raw.debug(...args);
+    safeWrite("DEBUG", args);
+  };
+}
+
 /**
  * 创建增强的日志记录器
  */
 function createLogger(options = {}) {
+  const rawConsole = {
+    log: typeof console.log === "function" ? console.log.bind(console) : () => {},
+    info: typeof console.info === "function" ? console.info.bind(console) : null,
+    warn: typeof console.warn === "function" ? console.warn.bind(console) : null,
+    error: typeof console.error === "function" ? console.error.bind(console) : null,
+    debug: typeof console.debug === "function" ? console.debug.bind(console) : null,
+  };
+
   const logDir = options.logDir || path.resolve(process.cwd(), "log");
   ensureDir(logDir);
 
@@ -220,15 +291,77 @@ function createLogger(options = {}) {
     3
   );
 
-  const now = new Date();
-  const logFileName = `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, "0")}-${String(
-    now.getDate()
-  ).padStart(2, "0")}_${String(now.getHours()).padStart(2, "0")}-${String(now.getMinutes()).padStart(
-    2,
-    "0"
-  )}-${String(now.getSeconds()).padStart(2, "0")}.log`;
+  // Reuse retentionDays for rotation (no extra env vars):
+  // - When retention is enabled (>0), rotate every N days.
+  // - On rotation, delete older log files (keep only the new log).
+  const rotationPeriodMs = retentionDays > 0 ? retentionDays * 24 * 60 * 60 * 1000 : null;
+  let lastRotationAtMs = Date.now();
+  let rotationInProgress = false;
 
-  const logFile = path.join(logDir, logFileName);
+  const formatDateKey = (date) =>
+    `${date.getFullYear()}-${String(date.getMonth() + 1).padStart(2, "0")}-${String(date.getDate()).padStart(2, "0")}`;
+
+  const formatLogFileName = (date, sequence) => {
+    const base = `${formatDateKey(date)}_${String(date.getHours()).padStart(2, "0")}-${String(date.getMinutes()).padStart(
+      2
+    )}-${String(date.getSeconds()).padStart(2, "0")}`;
+    const suffix = sequence > 0 ? `_${String(sequence).padStart(3, "0")}` : "";
+    return `${base}${suffix}.log`;
+  };
+
+  const pickLogFilePath = (date) => {
+    for (let seq = 0; seq < 1000; seq++) {
+      const filePath = path.join(logDir, formatLogFileName(date, seq));
+      if (!fs.existsSync(filePath)) return filePath;
+    }
+    // Fallback: should be practically unreachable.
+    return path.join(logDir, formatLogFileName(date, Math.floor(Math.random() * 1000) + 1));
+  };
+
+  let currentLogFile = pickLogFilePath(new Date());
+
+  const purgeOtherLogs = async () => {
+    const keepPath = path.resolve(currentLogFile);
+    let entries = [];
+    try {
+      entries = await fs.promises.readdir(logDir, { withFileTypes: true });
+    } catch {
+      return;
+    }
+
+    await Promise.all(
+      entries.map(async (entry) => {
+        if (!entry.isFile()) return;
+        if (!entry.name.endsWith(".log")) return;
+
+        const filePath = path.resolve(path.join(logDir, entry.name));
+        if (filePath === keepPath) return;
+
+        try {
+          await fs.promises.unlink(filePath);
+        } catch {
+          // ignore (locked file / permission / race)
+        }
+      })
+    );
+  };
+
+  const rotateLogFile = (reason) => {
+    const now = new Date();
+    currentLogFile = pickLogFilePath(now);
+    attachConsoleCaptureToLogFile(currentLogFile, rawConsole);
+
+    // Emit a small marker so operators can see rotation boundaries.
+    console.log(`${Colors.gray}[${formatTimestamp()}]${Colors.reset} ${Colors.cyan}🌀${Colors.reset} 日志轮转 (${reason}) -> ${currentLogFile}`);
+
+    // Best-effort: purge old logs shortly after switching the target file.
+    const timer = setTimeout(() => {
+      purgeOtherLogs().catch(() => {});
+    }, 1500);
+    if (typeof timer.unref === "function") timer.unref();
+  };
+
+  attachConsoleCaptureToLogFile(currentLogFile, rawConsole);
   
   const minLevel = options.minLevel || "debug";
   const minPriority = (LogLevels[minLevel] || LogLevels.debug).priority;
@@ -245,7 +378,11 @@ function createLogger(options = {}) {
 
   console.log(`${Colors.cyan}${Box.topLeft}${Box.horizontal.repeat(58)}${Box.topRight}${Colors.reset}`);
   console.log(`${Colors.cyan}${Box.vertical}${Colors.reset}  ${Colors.bold}📝 日志系统初始化${Colors.reset}${" ".repeat(39)}${Colors.cyan}${Box.vertical}${Colors.reset}`);
-  console.log(`${Colors.cyan}${Box.vertical}${Colors.reset}  ${Colors.gray}文件: ${logFile}${Colors.reset}${" ".repeat(Math.max(0, 56 - 7 - logFile.length))}${Colors.cyan}${Box.vertical}${Colors.reset}`);
+  console.log(
+    `${Colors.cyan}${Box.vertical}${Colors.reset}  ${Colors.gray}文件: ${currentLogFile}${Colors.reset}${" ".repeat(
+      Math.max(0, 56 - 7 - currentLogFile.length)
+    )}${Colors.cyan}${Box.vertical}${Colors.reset}`
+  );
   console.log(`${Colors.cyan}${Box.bottomLeft}${Box.horizontal.repeat(58)}${Box.bottomRight}${Colors.reset}`);
 
   // 日志清理
@@ -263,6 +400,40 @@ function createLogger(options = {}) {
       cleanupOldLogs(logDir, retentionDays).catch(() => {});
     }, intervalMs);
     if (typeof timer.unref === "function") timer.unref();
+  }
+
+  const maybeRotate = (reason) => {
+    if (!rotationPeriodMs) return;
+    const nowMs = Date.now();
+    if (nowMs - lastRotationAtMs < rotationPeriodMs) return;
+    if (rotationInProgress) return;
+
+    rotationInProgress = true;
+    try {
+      lastRotationAtMs = nowMs;
+      rotateLogFile(reason);
+    } finally {
+      rotationInProgress = false;
+    }
+  };
+
+  if (rotationPeriodMs) {
+    const MAX_TIMEOUT_MS = 2 ** 31 - 1;
+    const scheduleNextRotation = () => {
+      const elapsed = Date.now() - lastRotationAtMs;
+      const remaining = rotationPeriodMs - elapsed;
+      const delayMs = Math.min(Math.max(1000, remaining), MAX_TIMEOUT_MS);
+      const timer = setTimeout(() => {
+        try {
+          maybeRotate("retention");
+        } finally {
+          scheduleNextRotation();
+        }
+      }, delayMs);
+      if (typeof timer.unref === "function") timer.unref();
+    };
+
+    scheduleNextRotation();
   }
 
   /**
@@ -334,6 +505,9 @@ function createLogger(options = {}) {
     
     // 过滤低优先级日志
     if (levelConfig.priority < minPriority) return;
+
+    // Rotation fallback (in case timer is skipped / clock drift)
+    maybeRotate("retention");
     
     const timestamp = formatTimestamp();
     const fullTimestamp = formatFullTimestamp();
@@ -367,15 +541,15 @@ function createLogger(options = {}) {
       }
     }
     
-    console.log(consoleOutput);
+    rawConsole.log(consoleOutput);
     
     // 文件日志（纯文本，无颜色）
     const separator = "-".repeat(60);
     const metaContent = meta !== null && meta !== undefined ? formatLogContent(meta) : "";
     const fileEntry = `[${fullTimestamp}] [${levelConfig.label}] ${safeMessage}\n${metaContent ? metaContent + "\n" : ""}${separator}\n`;
-    
-    fs.appendFile(logFile, fileEntry, (err) => {
-      if (err) console.error("Failed to write to log file:", err);
+
+    fs.appendFile(currentLogFile, fileEntry, (err) => {
+      if (err && typeof rawConsole.error === "function") rawConsole.error("Failed to write to log file:", err);
     });
   };
 
@@ -585,7 +759,9 @@ function createLogger(options = {}) {
 
   return { 
     log, 
-    logFile,
+    get logFile() {
+      return currentLogFile;
+    },
     logRequest,
     logResponse,
     logUpstream,
@@ -610,8 +786,36 @@ function createLogger(options = {}) {
   };
 }
 
+function ensureLogger(input) {
+  const noop = () => {};
+
+  const base =
+    input && typeof input.log === "function"
+      ? input
+      : typeof input === "function"
+        ? { log: (...args) => input(...args) }
+        : null;
+
+  const logger = base || { log: noop };
+  const pick = (fn) => (typeof fn === "function" ? fn : noop);
+
+  return {
+    ...logger,
+    log: pick(logger.log),
+    logStream: pick(logger.logStream),
+    logUpstream: pick(logger.logUpstream),
+    logRetry: pick(logger.logRetry),
+    logQuota: pick(logger.logQuota),
+    logError: pick(logger.logError),
+    logRequest: pick(logger.logRequest),
+    logResponse: pick(logger.logResponse),
+    logAccount: pick(logger.logAccount),
+  };
+}
+
 module.exports = {
   createLogger,
+  ensureLogger,
   Colors,
   LogLevels,
   Box,

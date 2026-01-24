@@ -10,3 +10,4 @@ node_modules/
 .ace-tool/
 AgentLogs/
 .tmp_CLIProxyAPI/
+src/transform/claude/tool_thought_signatures.json

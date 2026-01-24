@@ -1,6 +1,3 @@
-// Proxy must be initialized before any fetch
-require("./utils/proxy");
-
 const http = require("http");
 const path = require("path");
 
@@ -17,14 +14,8 @@ const config = getConfig();
 const logger = createLogger({ logRetentionDays: config.log?.retention_days });
 const debugRequestResponse = !!config.debug;
 
-// 兼容旧的日志 API
-const log = (level, data) => {
-  if (typeof level === "string" && data !== undefined) {
-    logger.log(level, data);
-  } else {
-    logger.log("info", level, data);
-  }
-};
+// Proxy must be initialized before any fetch
+require("./utils/proxy");
 
 const authManager = new AuthManager({
   authDir: path.resolve(process.cwd(), "auths"),
@@ -77,6 +68,25 @@ async function writeResponse(res, apiResponse) {
   return res.end(JSON.stringify(body));
 }
 
+function safeWriteJson(res, statusCode, body) {
+  if (!res || res.writableEnded || res.destroyed) return;
+
+  try {
+    if (!res.headersSent) {
+      res.writeHead(statusCode, { ...CORS_HEADERS, "Content-Type": "application/json" });
+      res.end(JSON.stringify(body));
+      return;
+    }
+
+    // Headers already sent (usually streaming). Best-effort close without throwing.
+    res.end();
+  } catch (_) {
+    try {
+      res.destroy();
+    } catch (_) {}
+  }
+}
+
 const PORT = config.server?.port || 3000;
 const HOST = config.server?.host || "0.0.0.0";
 
@@ -85,6 +95,114 @@ let requestCounter = 0;
 
 function generateRequestId() {
   return `REQ-${Date.now().toString(36)}-${(++requestCounter).toString(36).padStart(4, "0")}`.toUpperCase();
+}
+
+const ANSI_REGEX =
+  /[\u001B\u009B][[\]()#;?]*(?:(?:;[-a-zA-Z\d/#&.:=?%@~_]*)?\u0007|(?:\d{1,4}(?:;\d{0,4})*)?[\dA-PR-TZcf-ntqry=><~])/g;
+// Zero-width code points that should not contribute to printed width
+const ZERO_WIDTH_CODEPOINTS = new Set([0x200b, 0x200c, 0x200d, 0x200e, 0x200f, 0x2060, 0xfeff]);
+
+/**
+ * Strip ANSI escape sequences so width calculations only consider printable characters.
+ */
+function stripAnsi(value = "") {
+  return String(value).replace(ANSI_REGEX, "");
+}
+
+/**
+ * Determine whether a code point should be treated as full-width (occupying two columns).
+ * The ranges follow Unicode East Asian Width plus emoji blocks we render as wide.
+ */
+function isFullWidthCodePoint(codePoint = 0) {
+  return (
+    (codePoint >= 0x1100 && codePoint <= 0x115f) ||
+    codePoint === 0x2329 ||
+    codePoint === 0x232a ||
+    (codePoint >= 0x2e80 && codePoint <= 0xa4cf && codePoint !== 0x303f) ||
+    (codePoint >= 0xac00 && codePoint <= 0xd7a3) ||
+    (codePoint >= 0xf900 && codePoint <= 0xfaff) ||
+    (codePoint >= 0xfe10 && codePoint <= 0xfe19) ||
+    (codePoint >= 0xfe30 && codePoint <= 0xfe6f) ||
+    (codePoint >= 0xff00 && codePoint <= 0xff60) ||
+    (codePoint >= 0xffe0 && codePoint <= 0xffe6) ||
+    (codePoint >= 0x1f300 && codePoint <= 0x1f64f) ||
+    (codePoint >= 0x1f650 && codePoint <= 0x1f8ff) ||
+    (codePoint >= 0x1f900 && codePoint <= 0x1f9ff) ||
+    (codePoint >= 0x20000 && codePoint <= 0x3fffd)
+  );
+}
+
+/**
+ * Combining marks and variation selectors that overlay previous glyphs.
+ * They should not add additional display width.
+ */
+function isCombiningMark(codePoint = 0) {
+  return (
+    (codePoint >= 0x0300 && codePoint <= 0x036f) ||
+    (codePoint >= 0x1ab0 && codePoint <= 0x1aff) ||
+    (codePoint >= 0x1dc0 && codePoint <= 0x1dff) ||
+    (codePoint >= 0x20d0 && codePoint <= 0x20ff) ||
+    (codePoint >= 0xfe00 && codePoint <= 0xfe0f) ||
+    (codePoint >= 0xfe20 && codePoint <= 0xfe2f)
+  );
+}
+
+/**
+ * Calculate printable width contribution for a single code point.
+ */
+function getCodePointWidth(codePoint) {
+  if (!Number.isFinite(codePoint)) return 0;
+  if (codePoint <= 0x1f || (codePoint >= 0x7f && codePoint <= 0x9f)) return 0;
+  if (ZERO_WIDTH_CODEPOINTS.has(codePoint)) return 0;
+  if (isCombiningMark(codePoint)) return 0;
+  return isFullWidthCodePoint(codePoint) ? 2 : 1;
+}
+
+/**
+ * Calculate the display width of a string, taking ANSI escapes, emoji, and
+ * combining marks into account.
+ */
+function getDisplayWidth(input = "") {
+  const clean = stripAnsi(input);
+  let width = 0;
+
+  for (const char of [...clean]) {
+    const codePoint = char.codePointAt(0);
+    width += getCodePointWidth(codePoint);
+  }
+
+  return width;
+}
+
+/**
+ * Truncate a string to a target display width using an ellipsis prefix while
+ * preserving the end of the string (e.g., a file path). The default
+ * maxWidth of 40 is intended for constrained display areas (such as the
+ * startup banner); callers should pass a larger maxWidth when more space
+ * is available.
+ */
+function truncateDisplayWidth(input = "", maxWidth = 40, ellipsis = "...") {
+  const text = stripAnsi(String(input));
+  if (getDisplayWidth(text) <= maxWidth) return text;
+
+  const ellipsisWidth = getDisplayWidth(ellipsis);
+  const targetWidth = Math.max(0, maxWidth - ellipsisWidth);
+
+  const graphemes = typeof Intl !== "undefined" && Intl.Segmenter
+    ? Array.from(new Intl.Segmenter(undefined, { granularity: "grapheme" }).segment(text), (s) => s.segment)
+    : [...text];
+
+  let suffixWidth = 0;
+  let suffix = "";
+  for (let i = graphemes.length - 1; i >= 0; i--) {
+    const chunk = graphemes[i];
+    const width = getDisplayWidth(chunk);
+    if (suffixWidth + width > targetWidth) break;
+    suffix = chunk + suffix;
+    suffixWidth += width;
+  }
+
+  return `${ellipsis}${suffix}`;
 }
 
 const server = http.createServer(async (req, res) => {
@@ -261,13 +379,11 @@ const server = http.createServer(async (req, res) => {
   } catch (err) {
     if (err && err.message === "INVALID_JSON") {
       logger.log("warn", `📝 无效的 JSON 请求体`, { requestId });
-      res.writeHead(400, { ...CORS_HEADERS, "Content-Type": "application/json" });
-      res.end(JSON.stringify({ error: { message: "Invalid JSON body" } }));
+      safeWriteJson(res, 400, { error: { message: "Invalid JSON body" } });
       return;
     }
     logger.logError("请求处理失败", err, { requestId });
-    res.writeHead(500, { ...CORS_HEADERS, "Content-Type": "application/json" });
-    res.end(JSON.stringify({ error: { message: "Internal Server Error" } }));
+    safeWriteJson(res, 500, { error: { message: "Internal Server Error" } });
   }
 });
 
@@ -295,14 +411,23 @@ const server = http.createServer(async (req, res) => {
 
   server.listen(PORT, HOST, () => {
     const separator = Box.horizontal.repeat(56);
+    const innerWidth = getDisplayWidth(separator);
+    const formatBoxLine = (text = "") => {
+      const visibleWidth = getDisplayWidth(text);
+      const padding = Math.max(0, innerWidth - visibleWidth - 2);
+      // NOTE: Padding assumes the terminal's Unicode display width matches getDisplayWidth.
+      // Certain emoji in some terminals may render wider and cause minor visual offsets.
+      return `${Colors.green}${Box.vertical}${Colors.reset} ${text}${" ".repeat(padding)} ${Colors.green}${Box.vertical}${Colors.reset}`;
+    };
     
     console.log(`\n${Colors.green}${Box.topLeft}${separator}${Box.topRight}${Colors.reset}`);
-    console.log(`${Colors.green}${Box.vertical}${Colors.reset}  ${Colors.bold}🚀 Antigravity2API 服务器已启动${Colors.reset}${" ".repeat(25)}${Colors.green}${Box.vertical}${Colors.reset}`);
-    console.log(`${Colors.green}${Box.vertical}${Colors.reset}${" ".repeat(56)}${Colors.green}${Box.vertical}${Colors.reset}`);
-    console.log(`${Colors.green}${Box.vertical}${Colors.reset}  ${Colors.dim}📍 地址:${Colors.reset} http://${HOST}:${PORT}${" ".repeat(Math.max(0, 35 - HOST.length - String(PORT).length))}${Colors.green}${Box.vertical}${Colors.reset}`);
-    console.log(`${Colors.green}${Box.vertical}${Colors.reset}  ${Colors.dim}🔗 Gemini:${Colors.reset} http://${HOST}:${PORT}/v1beta${" ".repeat(Math.max(0, 28 - HOST.length - String(PORT).length))}${Colors.green}${Box.vertical}${Colors.reset}`);
-    console.log(`${Colors.green}${Box.vertical}${Colors.reset}  ${Colors.dim}🔗 Claude:${Colors.reset} http://${HOST}:${PORT}/v1/messages${" ".repeat(Math.max(0, 24 - HOST.length - String(PORT).length))}${Colors.green}${Box.vertical}${Colors.reset}`);
-    console.log(`${Colors.green}${Box.vertical}${Colors.reset}  ${Colors.dim}📝 日志:${Colors.reset} ${logger.logFile.length > 40 ? "..." + logger.logFile.slice(-37) : logger.logFile}${" ".repeat(Math.max(0, 46 - Math.min(40, logger.logFile.length)))}${Colors.green}${Box.vertical}${Colors.reset}`);
+    console.log(formatBoxLine(`${Colors.bold}🚀 Antigravity2API 服务器已启动${Colors.reset}`));
+    console.log(formatBoxLine());
+    console.log(formatBoxLine(`${Colors.dim}📍 地址:${Colors.reset} http://${HOST}:${PORT}`));
+    console.log(formatBoxLine(`${Colors.dim}🔗 Gemini:${Colors.reset} http://${HOST}:${PORT}/v1beta`));
+    console.log(formatBoxLine(`${Colors.dim}🔗 Claude:${Colors.reset} http://${HOST}:${PORT}/v1/messages`));
+    const logPath = truncateDisplayWidth(logger.logFile, 40);
+    console.log(formatBoxLine(`${Colors.dim}📝 日志:${Colors.reset} ${logPath}`));
     console.log(`${Colors.green}${Box.bottomLeft}${separator}${Box.bottomRight}${Colors.reset}\n`);
 
     if (authManager.accounts && authManager.accounts.length === 0) {

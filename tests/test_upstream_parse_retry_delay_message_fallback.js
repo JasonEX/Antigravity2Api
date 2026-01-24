@@ -1,5 +1,14 @@
 const UpstreamClient = require("../src/api/upstream");
 
+const noop = () => {};
+const testLogger = {
+  log: noop,
+  logUpstream: noop,
+  logRetry: noop,
+  logQuota: noop,
+  logError: noop,
+};
+
 function assertEqual(actual, expected, label) {
   if (actual !== expected) {
     throw new Error(`${label}: expected ${expected}, got ${actual}`);
@@ -7,7 +16,7 @@ function assertEqual(actual, expected, label) {
 }
 
 function main() {
-  const upstream = new UpstreamClient(null);
+  const upstream = new UpstreamClient(null, { logger: testLogger });
 
   const fromJsonMessage = upstream.parseRetryDelayMs(
     JSON.stringify({ error: { message: "Your quota will reset after 3s." } })
@@ -28,4 +37,3 @@ try {
   console.error("❌ test_upstream_parse_retry_delay_message_fallback: FAIL\n", err);
   process.exitCode = 1;
 }
-

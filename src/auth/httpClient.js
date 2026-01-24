@@ -1,11 +1,14 @@
 const crypto = require("crypto");
 
-const { ensureAntigravitySystemInstruction } = require("./antigravitySystemInstruction");
-
 const DEFAULT_V1INTERNAL_BASE_URLS = [
   "https://daily-cloudcode-pa.sandbox.googleapis.com/v1internal",
   "https://daily-cloudcode-pa.googleapis.com/v1internal",
   "https://cloudcode-pa.googleapis.com/v1internal",
+];
+
+const DEFAULT_CLOUDCODE_BASE_URLS = [
+  "https://cloudcode-pa.googleapis.com",
+  "https://daily-cloudcode-pa.sandbox.googleapis.com",
 ];
 
 function normalizeV1InternalBaseUrl(baseUrl) {
@@ -34,10 +37,83 @@ function buildV1InternalUrl(method, queryString = "", baseUrl) {
   return `${resolvedBaseUrl}:${method}${qs}`;
 }
 
+function getCloudCodeBaseUrls() {
+  const raw = process.env.AG2API_CLOUDCODE_BASE_URLS;
+  if (raw && String(raw).trim()) {
+    const urls = String(raw)
+      .split(",")
+      .map((u) => String(u || "").trim())
+      .filter(Boolean);
+    if (urls.length > 0) return urls;
+  }
+  return DEFAULT_CLOUDCODE_BASE_URLS;
+}
+
+function buildCloudCodeUrl(baseUrl, method, queryString = "") {
+  const base = String(baseUrl || "").trim().replace(/\/+$/, "");
+  const qs = queryString ? String(queryString) : "";
+  return `${base}/v1internal:${method}${qs}`;
+}
+
+function shouldTryNextCloudCodeEndpoint(status) {
+  const code = Number.isFinite(status) ? status : null;
+  if (code === null) return true;
+  if (code === 404 || code === 408 || code === 429) return true;
+  return code >= 500 && code <= 599;
+}
+
+const CLOUDCODE_METADATA = {
+  ideType: "ANTIGRAVITY",
+  platform: "PLATFORM_UNSPECIFIED",
+  pluginType: "GEMINI",
+};
+
+function extractProjectId(cloudaicompanionProject) {
+  if (typeof cloudaicompanionProject === "string") {
+    const trimmed = cloudaicompanionProject.trim();
+    return trimmed ? trimmed : null;
+  }
+
+  if (cloudaicompanionProject && typeof cloudaicompanionProject === "object") {
+    const id = cloudaicompanionProject.id;
+    if (typeof id === "string") {
+      const trimmed = id.trim();
+      return trimmed ? trimmed : null;
+    }
+  }
+
+  return null;
+}
+
+function pickOnboardTier(allowedTiers) {
+  const tiers = Array.isArray(allowedTiers) ? allowedTiers : [];
+
+  const defaultTier = tiers.find((tier) => {
+    if (!tier || typeof tier !== "object") return false;
+    if (!tier.isDefault) return false;
+    return typeof tier.id === "string" && tier.id.trim();
+  });
+  if (defaultTier?.id) return String(defaultTier.id).trim();
+
+  const firstTier = tiers.find((tier) => tier && typeof tier.id === "string" && tier.id.trim());
+  if (firstTier?.id) return String(firstTier.id).trim();
+
+  // Match vscode-antigravity-cockpit behavior.
+  if (tiers.length > 0) return "LEGACY";
+
+  return null;
+}
+
+function sleep(ms) {
+  return new Promise((resolve) => {
+    const timer = setTimeout(resolve, ms);
+    if (timer && typeof timer.unref === "function") timer.unref();
+  });
+}
+
 // OAuth client configuration: allow env override, fallback to built-in defaults (same as Antigravity2api)
 function getOAuthClient() {
-  const defaultClientId =
-    "1071006060591-tmhssin2h21lcre235vtolojh4g403ep.apps.googleusercontent.com";
+  const defaultClientId = "1071006060591-tmhssin2h21lcre235vtolojh4g403ep.apps.googleusercontent.com";
   const defaultClientSecret = "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";
   const clientId =
     process.env.GOOGLE_OAUTH_CLIENT_ID ||
@@ -78,16 +154,6 @@ async function callV1Internal(method, accessToken, body, options = {}) {
 
   await waitForApiSlot(limiter);
 
-  // Ensure Antigravity defaults for agent requests.
-  const needsSystemPrompt = method === "generateContent" || method === "streamGenerateContent";
-  if (needsSystemPrompt) {
-    if (body && typeof body === "object") {
-      if (!body.userAgent) body.userAgent = "antigravity";
-      if (!body.requestType) body.requestType = "agent";
-      ensureAntigravitySystemInstruction(body);
-    }
-  }
-
   const baseUrls = getV1InternalBaseUrlCandidates();
   let last429 = null;
   let lastErr = null;
@@ -100,7 +166,8 @@ async function callV1Internal(method, accessToken, body, options = {}) {
         headers: {
           "Content-Type": "application/json",
           Authorization: `Bearer ${accessToken}`,
-          "User-Agent": "antigravity/1.11.9 windows/amd64",
+          "User-Agent": "antigravity/ windows/arm64",
+          "Accept-Encoding": "gzip",
           ...extraHeaders,
         },
         body: JSON.stringify(body || {}),
@@ -126,45 +193,154 @@ async function callV1Internal(method, accessToken, body, options = {}) {
   throw lastErr || new Error("v1internal: no base URL available");
 }
 
-async function fetchProjectId(accessToken, limiter) {
-  const response = await callV1Internal(
-    "loadCodeAssist",
-    accessToken,
-    { metadata: { ideType: "ANTIGRAVITY" } },
-    {
-      limiter,
-      headers: {
-        // Preserve prior behavior.
-        "Accept-Encoding": "gzip",
-      },
-    }
-  );
+async function requestJson(method, accessToken, body, options = {}) {
+  const limiter = options.limiter;
+  const queryString = options.queryString || "";
+  const extraHeaders = options.headers && typeof options.headers === "object" ? options.headers : {};
 
-  const rawBody = await response.text().catch(() => "");
-
-  if (!response.ok) {
-    throw new Error(
-      `Failed to fetch projectId: ${response.status} ${response.statusText} ${rawBody}`.trim()
-    );
-  }
-
-  let data = {};
+  const response = await callV1Internal(method, accessToken, body, { limiter, queryString, headers: extraHeaders });
+  const text = await response.text().catch(() => "");
+  let data = null;
   try {
-    data = rawBody ? JSON.parse(rawBody) : {};
-  } catch (err) {}
-
-  return { projectId: data?.cloudaicompanionProject, rawBody };
+    data = text ? JSON.parse(text) : {};
+  } catch (_) {
+    data = {};
+  }
+  return { response, text, data };
 }
 
-async function fetchAvailableModels(accessToken, limiter) {
-  const response = await callV1Internal("fetchAvailableModels", accessToken, {}, { limiter });
+async function tryOnboardUser(accessToken, tierId, limiter, options = {}) {
+  const maxAttempts = Number.isInteger(options.maxAttempts) ? options.maxAttempts : 3;
+  const delayMs = Number.isFinite(options.delayMs) ? options.delayMs : 1000;
 
-  if (!response.ok) {
-    throw new Error(`Failed to fetch models: ${response.status} ${response.statusText}`);
+  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+    const { response, data, text } = await requestJson(
+      "onboardUser",
+      accessToken,
+      { tierId, metadata: CLOUDCODE_METADATA },
+      { limiter },
+    );
+
+    if (!response.ok) {
+      throw new Error(`onboardUser failed: ${response.status} ${response.statusText} ${text}`.trim());
+    }
+
+    if (data?.done) {
+      return extractProjectId(data?.response?.cloudaicompanionProject);
+    }
+
+    if (attempt < maxAttempts) {
+      await sleep(delayMs);
+    }
   }
 
-  const data = await response.json();
-  return data.models || {};
+  return null;
+}
+
+/**
+ * Resolve projectId from Cloud Code.
+ *
+ * Strategy (matches vscode-antigravity-cockpit-main):
+ * 1) call loadCodeAssist -> read cloudaicompanionProject (string or {id})
+ * 2) if missing, pick tier from allowedTiers/currentTier/paidTier and call onboardUser until done
+ * 3) retry the whole flow up to maxAttempts
+ *
+ * @param {string} accessToken
+ * @param {any} limiter
+ * @param {object} [options]
+ * @param {number} [options.maxAttempts]
+ * @param {object} [options.onboard]
+ * @returns {Promise<string>}
+ */
+async function fetchProjectId(accessToken, limiter, options = {}) {
+  const maxAttempts = Number.isInteger(options.maxAttempts) ? options.maxAttempts : 3;
+  let lastErr = null;
+
+  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+    try {
+      const { response, data, text } = await requestJson(
+        "loadCodeAssist",
+        accessToken,
+        { metadata: CLOUDCODE_METADATA },
+        { limiter },
+      );
+
+      if (!response.ok) {
+        throw new Error(`loadCodeAssist failed: ${response.status} ${response.statusText} ${text}`.trim());
+      }
+
+      const projectId = extractProjectId(data?.cloudaicompanionProject);
+      if (projectId) {
+        return projectId;
+      }
+
+      const tierIdRaw = data?.paidTier?.id || data?.currentTier?.id;
+      const tierId = tierIdRaw ? String(tierIdRaw).trim() : "";
+      const onboardTier = pickOnboardTier(data?.allowedTiers) || tierId;
+      if (!onboardTier) {
+        throw new Error("loadCodeAssist returned no projectId and no tierId/allowedTiers to onboard");
+      }
+
+      const onboarded = await tryOnboardUser(accessToken, onboardTier, limiter, options.onboard);
+      if (onboarded) {
+        return onboarded;
+      }
+
+      throw new Error("loadCodeAssist/onboardUser did not return a projectId");
+    } catch (err) {
+      lastErr = err instanceof Error ? err : new Error(String(err));
+    }
+  }
+
+  throw new Error(`Failed to resolve projectId after ${maxAttempts} attempts: ${lastErr?.message || "unknown error"}`);
+}
+
+async function fetchAvailableModels(accessToken, limiter, projectId) {
+  await waitForApiSlot(limiter);
+  // Pass projectId to get real quota data (not default 100%)
+  const payload = projectId ? { project: projectId } : {};
+  const baseUrls = getCloudCodeBaseUrls();
+  let lastErr = null;
+
+  for (let i = 0; i < baseUrls.length; i++) {
+    const baseUrl = baseUrls[i];
+    try {
+      const response = await fetch(buildCloudCodeUrl(baseUrl, "fetchAvailableModels"), {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          Authorization: `Bearer ${accessToken}`,
+          "User-Agent": "antigravity/ windows/arm64",
+        },
+        body: JSON.stringify(payload),
+      });
+
+      if (response.ok) {
+        const data = await response.json().catch(() => ({}));
+        return data.models || {};
+      }
+
+      const text = await response.text().catch(() => "");
+      const err = new Error(
+        `Failed to fetch models: ${response.status} ${response.statusText}${text ? ` ${text}` : ""}`.trim(),
+      );
+      err.status = response.status;
+      lastErr = err;
+
+      if (i < baseUrls.length - 1 && shouldTryNextCloudCodeEndpoint(response.status)) {
+        continue;
+      }
+      throw err;
+    } catch (err) {
+      lastErr = err instanceof Error ? err : new Error(String(err));
+      if (i < baseUrls.length - 1) {
+        continue;
+      }
+      throw lastErr;
+    }
+  }
+
+  throw lastErr || new Error("Failed to fetch models");
 }
 
 async function fetchUserInfo(accessToken, limiter) {
