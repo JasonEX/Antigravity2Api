@@ -11,7 +11,7 @@ const {
 } = require("../../mcp/mcpXmlBridge");
 const { mapClaudeModelFromEnv } = require("../modelMap");
 const { getToolThoughtSignature, deleteToolThoughtSignature, isDebugEnabled } = require("./ToolThoughtSignatureStore");
-const { cleanJsonSchema, extractInlineDataPartsFromClaudeToolResultContent } = require("./ClaudeRequestUtils");
+const { cleanJsonSchema, cleanJsonSchemaForAntigravity, extractInlineDataPartsFromClaudeToolResultContent } = require("./ClaudeRequestUtils");
 
 function normalizeAntigravitySystemInstructionText(text) {
   if (typeof text !== "string") return "";
@@ -197,6 +197,9 @@ function transformClaudeRequestIn(claudeReq, projectId, options = {}) {
   const hasWebSearchTool = Array.isArray(claudeReq.tools) && claudeReq.tools.some((tool) => tool?.name === "web_search");
 
   const isClaudeModel = String(mapClaudeModelToGemini(claudeReq.model)).startsWith("claude");
+  const mappedModelName = mapClaudeModelToGemini(claudeReq.model);
+  const needsValidatedToolSchema =
+    typeof mappedModelName === "string" && (mappedModelName.startsWith("claude") || mappedModelName === "gemini-3-pro-high");
   const mcpXmlEnabled = isMcpXmlEnabled() && getMcpTools(claudeReq?.tools).length > 0;
 
   // thoughtSignature（Thought Signatures 协议）：
@@ -637,10 +640,13 @@ function transformClaudeRequestIn(claudeReq, projectId, options = {}) {
         //   continue;
         // }
         if (tool.input_schema) {
+          const cleanedSchema = needsValidatedToolSchema
+            ? cleanJsonSchemaForAntigravity(tool.input_schema)
+            : cleanJsonSchema(tool.input_schema);
           const toolDecl = {
             name: tool.name,
             description: tool.description,
-            parameters: cleanJsonSchema(tool.input_schema),
+            parameters: cleanedSchema,
           };
           tools[0].functionDeclarations.push(toolDecl);
         }
@@ -707,6 +713,23 @@ function transformClaudeRequestIn(claudeReq, projectId, options = {}) {
           ? tools
           : undefined,
   };
+
+  // Claude models (and a few validated-only upstreams) require VALIDATED tool schema mode.
+  if (
+    needsValidatedToolSchema &&
+    innerRequest.tools &&
+    Array.isArray(innerRequest.tools) &&
+    innerRequest.tools[0] &&
+    innerRequest.tools[0].functionDeclarations &&
+    Array.isArray(innerRequest.tools[0].functionDeclarations) &&
+    innerRequest.tools[0].functionDeclarations.length > 0
+  ) {
+    innerRequest.toolConfig = {
+      functionCallingConfig: {
+        mode: "VALIDATED",
+      },
+    };
+  }
 
   if (systemInstruction) {
     innerRequest.systemInstruction = systemInstruction;

@@ -2,6 +2,7 @@ const crypto = require("crypto");
 const fs = require("fs");
 const path = require("path");
 const { mapGeminiModelFromEnv } = require("../modelMap");
+const { cleanJsonSchemaForAntigravity } = require("../claude/ClaudeRequestUtils");
 
 function normalizeAntigravitySystemInstructionText(text) {
   if (typeof text !== "string") return "";
@@ -124,19 +125,30 @@ function uppercaseSchemaTypes(schema) {
   return result;
 }
 
-function normalizeTools(tools) {
+function normalizeTools(tools, options = {}) {
   if (!Array.isArray(tools)) return tools;
+  const schemaMode = options.schemaMode === "antigravity" ? "antigravity" : "gemini";
+
+  function normalizeParameters(parameters) {
+    if (!parameters || typeof parameters !== "object") return parameters;
+    if (schemaMode === "antigravity") {
+      return cleanJsonSchemaForAntigravity(parameters);
+    }
+    return uppercaseSchemaTypes(cleanSchema(parameters));
+  }
+
   return tools.map((tool) => {
     if (tool && Array.isArray(tool.functionDeclarations)) {
       tool.functionDeclarations = tool.functionDeclarations.map((fn) => {
         if (fn && typeof fn === "object") {
           if ("parametersJsonSchema" in fn) {
             const { parametersJsonSchema, ...rest } = fn;
-            const parameters = uppercaseSchemaTypes(cleanSchema(parametersJsonSchema));
+            const parameters = normalizeParameters(parametersJsonSchema);
             return parameters ? { ...rest, parameters } : rest;
           }
           if ("parameters" in fn && typeof fn.parameters === "object") {
-            return { ...fn, parameters: uppercaseSchemaTypes(cleanSchema(fn.parameters)) };
+            const parameters = normalizeParameters(fn.parameters);
+            return parameters ? { ...fn, parameters } : fn;
           }
         }
         return fn;
@@ -171,10 +183,6 @@ function wrapRequest(clientJson, options) {
   }
 
   // Normalize tools schema for v1internal
-  if (Array.isArray(innerRequest?.tools)) {
-    innerRequest.tools = normalizeTools(innerRequest.tools);
-  }
-
   // Map preview model name based on thinking level (high/low)
   let mappedModelName = mapGeminiModelFromEnv(modelName) || modelName;
   const levelForMapping = innerRequest?.generationConfig?.thinkingConfig?.thinkingLevel;
@@ -189,6 +197,26 @@ function wrapRequest(clientJson, options) {
 
   const modelNameLower = String(mappedModelName || "").toLowerCase();
   const isClaudeModel = modelNameLower.includes("claude");
+  const needsValidatedToolSchema = isClaudeModel || mappedModelName === "gemini-3-pro-high";
+
+  // Normalize tools schema for v1internal (Claude/validated models require draft 2020-12 compatible schemas).
+  if (Array.isArray(innerRequest?.tools)) {
+    innerRequest.tools = normalizeTools(innerRequest.tools, { schemaMode: needsValidatedToolSchema ? "antigravity" : "gemini" });
+  }
+
+  // Claude/validated upstreams require explicit toolConfig mode.
+  if (needsValidatedToolSchema && Array.isArray(innerRequest?.tools)) {
+    const hasFunctionDeclarations = innerRequest.tools.some(
+      (t) => t && Array.isArray(t.functionDeclarations) && t.functionDeclarations.length > 0,
+    );
+    if (hasFunctionDeclarations) {
+      if (!innerRequest.toolConfig || typeof innerRequest.toolConfig !== "object") innerRequest.toolConfig = {};
+      if (!innerRequest.toolConfig.functionCallingConfig || typeof innerRequest.toolConfig.functionCallingConfig !== "object") {
+        innerRequest.toolConfig.functionCallingConfig = {};
+      }
+      innerRequest.toolConfig.functionCallingConfig.mode = "VALIDATED";
+    }
+  }
 
   // Ensure generationConfig is an object for downstream mutations.
   if (!innerRequest.generationConfig || typeof innerRequest.generationConfig !== "object") {

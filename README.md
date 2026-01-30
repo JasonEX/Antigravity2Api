@@ -109,6 +109,8 @@ AG2API_DEBUG=false
 AG2API_LOG_RETENTION_DAYS=3
 AG2API_RETRY_DELAY_MS=1200
 AG2API_QUOTA_REFRESH_S=300
+AG2API_ANTIGRAVITY_VERSION=
+AG2API_ANTIGRAVITY_USER_AGENT=
 AG2API_CLAUDE_MODEL_MAP={"claude-haiku-4-5":"gemini-3-flash","claude-haiku-4-5-20251001":"gemini-3-flash"}
 AG2API_GEMINI_MODEL_MAP={"gemini-3-flash-preview":"gemini-3-flash"}
 AG2API_MCP_XML_ENABLED=true
@@ -135,6 +137,8 @@ AG2API_THOUGHT_SIGNATURE_CACHE_MAX=50000
 - `AG2API_LOG_RETENTION_DAYS`：日志保留天数（默认 3；设为 0 表示不自动清理；当 >0 且服务长时间不重启时，会按该天数轮转日志文件，并在轮转后清理旧日志文件，避免单个日志无限增长）
 - `AG2API_RETRY_DELAY_MS`：网络错误 / 429 重试前的固定等待（毫秒，默认 1200）
 - `AG2API_QUOTA_REFRESH_S`：额度刷新间隔（秒；每次并发刷新所有账号；默认 300）
+- `AG2API_ANTIGRAVITY_VERSION`：用于生成默认 Antigravity `User-Agent` 的版本号（默认 `1.15.8`；仅在未设置 `AG2API_ANTIGRAVITY_USER_AGENT`/`AG2API_USER_AGENT` 时生效）
+- `AG2API_ANTIGRAVITY_USER_AGENT`：上游（Google v1internal / cloudcode-pa）调用时使用的 `User-Agent`（默认 `antigravity/<version> <os>/<arch>`，由运行环境自动推导；建议包含版本号；别名 `AG2API_USER_AGENT`）
 - `AG2API_CLAUDE_MODEL_MAP`：Claude 模型映射（Claude API 入站 model -> 上游 model），仅支持 JSON 对象字符串（支持多个映射）
 - `AG2API_GEMINI_MODEL_MAP`：Gemini 模型映射（Gemini API 入站 model -> 上游 model），仅支持 JSON 对象字符串（支持多个映射）
 - `AG2API_MCP_XML_ENABLED`：MCP XML 方案开关（仅 `mcp__*`）；开启后不透传 `mcp__* tools` 给 v1internal，改为 XML 协议桥接并在下游还原为 `tool_use/tool_result`

@@ -68,6 +68,28 @@ const CLOUDCODE_METADATA = {
   pluginType: "GEMINI",
 };
 
+function resolveAntigravityVersion() {
+  const raw = process.env.AG2API_ANTIGRAVITY_VERSION;
+  const v = typeof raw === "string" ? raw.trim() : "";
+  return v;
+}
+
+function buildDefaultAntigravityUserAgent(version) {
+  let platform = typeof process.platform === "string" ? process.platform : "linux";
+  if (platform === "win32") platform = "windows";
+
+  let arch = typeof process.arch === "string" ? process.arch : "amd64";
+  if (arch === "x64") arch = "amd64";
+
+  return `antigravity/${version} ${platform}/${arch}`;
+}
+
+function resolveAntigravityUserAgent() {
+  const raw = process.env.AG2API_ANTIGRAVITY_USER_AGENT || process.env.AG2API_USER_AGENT;
+  const ua = typeof raw === "string" ? raw.trim() : "";
+  return ua || buildDefaultAntigravityUserAgent(resolveAntigravityVersion());
+}
+
 function extractProjectId(cloudaicompanionProject) {
   if (typeof cloudaicompanionProject === "string") {
     const trimmed = cloudaicompanionProject.trim();
@@ -166,7 +188,7 @@ async function callV1Internal(method, accessToken, body, options = {}) {
         headers: {
           "Content-Type": "application/json",
           Authorization: `Bearer ${accessToken}`,
-          "User-Agent": "antigravity/ windows/arm64",
+          "User-Agent": resolveAntigravityUserAgent(),
           "Accept-Encoding": "gzip",
           ...extraHeaders,
         },
@@ -310,7 +332,7 @@ async function fetchAvailableModels(accessToken, limiter, projectId) {
         headers: {
           "Content-Type": "application/json",
           Authorization: `Bearer ${accessToken}`,
-          "User-Agent": "antigravity/ windows/arm64",
+          "User-Agent": resolveAntigravityUserAgent(),
         },
         body: JSON.stringify(payload),
       });
